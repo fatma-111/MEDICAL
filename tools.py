@@ -555,7 +555,32 @@ def list_specialties(state: Annotated[AgentState, InjectedState]) -> dict:
         return {"status": "error"}
 
     items = (result["data"] or {}).get("items", [])
-    specialties = [{"id": i.get("id"), "name": i.get("name")} for i in items if i.get("id")]
+    # The API exposes several name fields and `name` is not always
+    # populated - observed in production, an item came through with no
+    # usable name and the agent told the user "we have a specialty but
+    # its name is unclear to me". Fall back through the alternatives, and
+    # drop anything still nameless rather than surfacing a blank.
+    specialties = []
+    for item in items:
+        if not item.get("id"):
+            continue
+
+        name = (
+            item.get("name")
+            or item.get("formatedName")
+            or item.get("altName")
+            or item.get("code")
+        )
+
+        if not name or not str(name).strip():
+            logger.warning("Skipping specialty with no usable name: id=%s", item.get("id"))
+            continue
+
+        specialties.append({"id": item["id"], "name": str(name).strip()})
+
+    if not specialties:
+        logger.warning("list_specialties: API returned %d items but none had a usable name", len(items))
+        return {"status": "not_found"}
 
     return {"status": "found", "specialties": specialties}
 
@@ -602,20 +627,40 @@ def find_available_doctors(
         return {"status": "error"}
 
     items = (result["data"] or {}).get("items", [])
-    available = [i for i in items if i.get("hasSlots")]
+
+    # The server already filtered by hasPublishedService +
+    # hasServiceSchedule + the intersection window, so treat hasSlots as
+    # a refinement only: exclude a doctor ONLY when the API explicitly
+    # says hasSlots is False. Previously this required hasSlots to be
+    # truthy, which silently discarded EVERY doctor whenever the field
+    # was absent or null in the response - indistinguishable from
+    # "nobody is available".
+    available = [i for i in items if i.get("hasSlots") is not False]
+
+    logger.info(
+        "find_available_doctors: specialty_id=%s api_returned=%d after_hasSlots_filter=%d",
+        specialty_id, len(items), len(available),
+    )
 
     if not available:
         return {"status": "not_found"}
 
-    doctors = [
-        {
+    doctors = []
+    for i in available:
+        name = i.get("name") or i.get("formatedName") or i.get("altName")
+        if not name or not str(name).strip():
+            logger.warning("Skipping doctor with no usable name: id=%s", i.get("id"))
+            continue
+
+        doctors.append({
             "id": i.get("id"),
-            "name": i.get("name"),
+            "name": str(name).strip(),
             "specialtyName": i.get("specialtyName"),
             "degreeName": i.get("degreeName"),
-        }
-        for i in available
-    ]
+        })
+
+    if not doctors:
+        return {"status": "not_found"}
 
     return {"status": "found", "doctors": doctors}
 
