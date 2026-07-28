@@ -604,15 +604,28 @@ def list_specialties(state: Annotated[AgentState, InjectedState]) -> dict:
 @tool
 def find_available_doctors(
     state: Annotated[AgentState, InjectedState],
-    specialty_id: str,
+    specialty_ids: list,
     days_ahead: int = DOCTOR_AVAILABILITY_WINDOW_DAYS,
 ) -> dict:
-    """Find doctors of a given specialty who currently have a bookable
-    service AND an available schedule slot within the next `days_ahead`
-    days. ALWAYS call `list_specialties` first to get the correct
-    `specialty_id` - never guess or invent one. Returns:
+    """Find doctors who currently have a bookable service AND an available
+    schedule slot within the next `days_ahead` days, across one or more
+    specialties. ALWAYS call `list_specialties` first to get correct ids
+    - never guess or invent one.
+
+    IMPORTANT: pass ALL plausibly-matching specialty ids in ONE call as a
+    list, not just the single most obvious one. Clinics often have both
+    a general specialty and a more specific sub-specialty that could
+    both reasonably cover the same complaint (e.g. "Ophthalmology" AND
+    "Vitreoretinal Surgery" both relate to eye problems). If more than
+    one specialty from `list_specialties` could plausibly match what the
+    user described, include all of their ids here together - e.g.
+    specialty_ids=["<ophthalmology-id>", "<vitreoretinal-surgery-id>"] -
+    so a doctor registered under any of them is found. Do not conclude
+    "no doctors available" after checking only one plausible specialty.
+
+    Returns:
     {"status": "found", "doctors": [{"id", "name", "specialtyName", "degreeName"}, ...]}
-    {"status": "not_found"}  # this specialty exists, but no doctor has availability right now
+    {"status": "not_found"}  # these specialties exist, but no doctor has availability right now
     {"status": "not_configured"}  # this clinic doesn't have this feature set up yet
     {"status": "error"}  # the API call itself failed"""
 
@@ -628,7 +641,7 @@ def find_available_doctors(
 
     result = api.get_doctors(
         base_url,
-        specialty_ids=[specialty_id],
+        specialty_ids=specialty_ids,
         has_published_service=True,
         has_service_schedule=True,
         intersection_start=intersection_start,
@@ -637,8 +650,8 @@ def find_available_doctors(
 
     if not result["success"]:
         logger.error(
-            "find_available_doctors API call failed: base_url=%s specialty_id=%s status_code=%s error=%s",
-            base_url, specialty_id, result.get("status_code"), result.get("error"),
+            "find_available_doctors API call failed: base_url=%s specialty_ids=%s status_code=%s error=%s",
+            base_url, specialty_ids, result.get("status_code"), result.get("error"),
         )
         return {"status": "error"}
 
@@ -654,8 +667,8 @@ def find_available_doctors(
     available = [i for i in items if i.get("hasSlots") is not False]
 
     logger.info(
-        "find_available_doctors: specialty_id=%s api_returned=%d after_hasSlots_filter=%d",
-        specialty_id, len(items), len(available),
+        "find_available_doctors: specialty_ids=%s api_returned=%d after_hasSlots_filter=%d",
+        specialty_ids, len(items), len(available),
     )
 
     if not available:
