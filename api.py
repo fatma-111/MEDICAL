@@ -278,6 +278,17 @@ def _post_json(url: str, payload: dict, client_id: Optional[str] = None) -> dict
         logger.error("Doctors/Specialties API server error: %s status=%s body=%s", url, response.status_code, response.text[:1000])
         return _result(False, response.status_code, error="server_error")
 
+    if response.status_code == 404:
+        # A wrong endpoint PATH, not a bad request - this is a bug in our
+        # own URL construction (or a changed API), never something the
+        # user can fix by "trying again later". Called out separately so
+        # it can't hide behind a generic "validation_error" again.
+        logger.error(
+            "Doctors/Specialties API endpoint NOT FOUND (404) - check the URL path is correct: %s body=%s",
+            url, response.text[:500],
+        )
+        return _result(False, response.status_code, error="endpoint_not_found")
+
     if response.status_code >= 400:
         logger.error("Doctors/Specialties API validation error: %s status=%s body=%s", url, response.status_code, response.text[:1000])
         return _result(False, response.status_code, error="validation_error")
@@ -297,12 +308,21 @@ def _post_json(url: str, payload: dict, client_id: Optional[str] = None) -> dict
 
 
 def get_specialties(base_url: str, page_size: int = 200, client_id: Optional[str] = None) -> dict:
-    """POST {base_url}/api/Specialties/GetSpecialtiesPagedList.
+    """POST {base_url}/api/Specialties/GetList.
+
+    NOTE ON THE PATH: the Swagger UI labels this operation
+    "GetSpecialtiesPagedList", but that's the operation ID, NOT the HTTP
+    path - the actual path is /api/Specialties/GetList. This was
+    originally coded as /api/Specialties/GetSpecialtiesPagedList, which
+    returned 404 and surfaced to the user as a vague "technical problem"
+    (any 4xx was being reported as "validation_error"). Confirmed by the
+    same pattern on the Doctors endpoint, whose Swagger operation ID is
+    "GetDoctorsPagedList" but whose real path is /api/Doctors/GetList.
 
     Returns every specialty this clinic offers (scoped by base_url alone,
     confirmed directly - no separate organizationId/branchId needed)."""
 
-    url = f"{base_url}/api/Specialties/GetSpecialtiesPagedList"
+    url = f"{base_url}/api/Specialties/GetList"
     payload = {"pageNumber": 0, "pageSize": page_size}
 
     return _post_json(url, payload, client_id=client_id)
