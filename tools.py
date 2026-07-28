@@ -536,8 +536,23 @@ def list_specialties(state: Annotated[AgentState, InjectedState]) -> dict:
     symptom/concern - never guess whether this clinic has a given
     specialty. Returns:
     {"status": "found", "specialties": [{"id": ..., "name": ...}, ...]}
+    {"status": "not_found"}  # this clinic has no specialties registered
     {"status": "not_configured"}  # this clinic doesn't have this feature set up yet
-    {"status": "error"}  # the API call itself failed"""
+    {"status": "error"}  # the API call itself failed
+
+    IMPLEMENTATION NOTE: this uses the Specialties/GetList endpoint
+    directly. An earlier version derived specialties from the doctors
+    endpoint instead, after an initial test call to Specialties/GetList
+    returned mismatched placeholder data ("New NEw", unrelated ids).
+    That turned out to be stale/unrelated test data, not a real problem
+    with the endpoint - a follow-up call (after fixing pageNumber=1 and
+    the /GetList path) returned the correct, complete specialty list,
+    confirmed to share the exact same ids as the doctors' own
+    specialtyId field. Using this endpoint (rather than deriving from
+    doctors) is more correct: it includes every specialty this clinic
+    has registered, even ones with zero doctors currently assigned -
+    letting the agent correctly say "we don't offer that" only when
+    truly true, rather than only when nobody happens to be staffed."""
 
     base_url = _doctors_base_url(state)
 
@@ -555,11 +570,11 @@ def list_specialties(state: Annotated[AgentState, InjectedState]) -> dict:
         return {"status": "error"}
 
     items = (result["data"] or {}).get("items", [])
-    # The API exposes several name fields and `name` is not always
-    # populated - observed in production, an item came through with no
-    # usable name and the agent told the user "we have a specialty but
-    # its name is unclear to me". Fall back through the alternatives, and
-    # drop anything still nameless rather than surfacing a blank.
+
+    # The API's name fields are usually populated (confirmed against
+    # real data), but fall back through the alternatives defensively -
+    # dropping anything with no usable name at all rather than
+    # surfacing a blank to the user.
     specialties = []
     for item in items:
         if not item.get("id"):
@@ -578,8 +593,9 @@ def list_specialties(state: Annotated[AgentState, InjectedState]) -> dict:
 
         specialties.append({"id": item["id"], "name": str(name).strip()})
 
+    logger.info("list_specialties: %d specialties returned, %d usable", len(items), len(specialties))
+
     if not specialties:
-        logger.warning("list_specialties: API returned %d items but none had a usable name", len(items))
         return {"status": "not_found"}
 
     return {"status": "found", "specialties": specialties}
