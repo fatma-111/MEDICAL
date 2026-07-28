@@ -275,9 +275,11 @@ def _post_json(url: str, payload: dict, client_id: Optional[str] = None) -> dict
         return _result(False, error=str(exc))
 
     if response.status_code >= 500:
+        logger.error("Doctors/Specialties API server error: %s status=%s body=%s", url, response.status_code, response.text[:1000])
         return _result(False, response.status_code, error="server_error")
 
     if response.status_code >= 400:
+        logger.error("Doctors/Specialties API validation error: %s status=%s body=%s", url, response.status_code, response.text[:1000])
         return _result(False, response.status_code, error="validation_error")
 
     try:
