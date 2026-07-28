@@ -323,7 +323,12 @@ def get_specialties(base_url: str, page_size: int = 200, client_id: Optional[str
     confirmed directly - no separate organizationId/branchId needed)."""
 
     url = f"{base_url}/api/Specialties/GetList"
-    payload = {"pageNumber": 0, "pageSize": page_size}
+    # NOTE: pageNumber must be 1 or above, NOT 0 - confirmed directly
+    # from the API's own error response ("PageNumber should be above
+    # one", thrown by PagingOptions.set_PageNumber). The Swagger UI's
+    # example body shows "pageNumber": 0, but that's just a placeholder
+    # default and is rejected at runtime with a 500.
+    payload = {"pageNumber": 1, "pageSize": page_size}
 
     return _post_json(url, payload, client_id=client_id)
 
@@ -349,7 +354,8 @@ def get_doctors(
 
     url = f"{base_url}/api/Doctors/GetList"
     payload = {
-        "pageNumber": 0,
+        # Must be 1 or above, not 0 - see the note in get_specialties()
+        "pageNumber": 1,
         "pageSize": page_size,
         "hasPublishedService": has_published_service,
         "hasServiceSchedule": has_service_schedule,
