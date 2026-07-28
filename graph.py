@@ -303,6 +303,65 @@ _LANGUAGE_DIRECTIVE = {
 }
 
 
+# Generic medical-guidance requests observed in production that carry NO
+# actual symptom content - a plain ask for help, not a description of
+# what's wrong. Kept short and literal on purpose: this only needs to
+# catch the exact "just asking for guidance" pattern, not every possible
+# phrasing - a real symptom mention naturally has more content and won't
+# match these short strings.
+_GENERIC_MEDICAL_GUIDANCE_PHRASES = (
+    "توجيه طبي", "التوجيه الطبي", "عاوز توجيه طبي", "عاوزه توجيه طبي",
+    "ابغى توجيه طبي", "ابغي توجيه طبي", "عايز توجيه طبي", "عايزه توجيه طبي",
+    "محتاج توجيه طبي", "محتاجه توجيه طبي",
+    "medical guidance", "i want medical guidance", "i need medical guidance",
+)
+
+
+def _is_generic_medical_guidance_request(user_message: str) -> bool:
+    """
+    True when `user_message` is a bare request for medical guidance with
+    NO symptom described - e.g. "توجيه طبي" alone, as opposed to "توجيه
+    طبي، عيني وجعاني" which already names a symptom.
+
+    WHY THIS EXISTS: relying solely on the prose instruction not to
+    invent a comfort suggestion before a symptom is named was NOT
+    reliably followed even after being made explicit - observed directly
+    in production, more than once, after the fix had already been
+    deployed. This computes the same judgment deterministically instead,
+    and a dominant directive is injected at the top of the system
+    prompt for this specific turn (see agent()) rather than trusting a
+    rule buried in a long prompt.
+    """
+
+    normalized = (user_message or "").strip().lower()
+
+    if not normalized:
+        return False
+
+    # If the message is ONLY (allowing minor punctuation/whitespace) one
+    # of the known generic phrases, treat it as symptom-free. Anything
+    # with more content alongside it (even a few extra words) is assumed
+    # to potentially carry real symptom detail and is left to the LLM.
+    stripped = re.sub(r"[؟?!.,\s]+", " ", normalized).strip()
+
+    return any(stripped == phrase for phrase in _GENERIC_MEDICAL_GUIDANCE_PHRASES)
+
+
+_NO_SYMPTOM_YET_DIRECTIVE = (
+    "============================================================\n"
+    "NO SYMPTOM DESCRIBED YET\n"
+    "============================================================\n"
+    "The user has only asked for medical guidance in general - they have "
+    "NOT described any actual symptom or health concern yet. Your ENTIRE "
+    "reply must be limited to warmly asking what the symptom or issue "
+    "is. Do NOT include any comfort/self-care suggestion in this reply - "
+    "there is nothing yet to tailor one to, and inventing one (e.g. "
+    "generic rest/warm-tea advice) with no actual symptom mentioned is "
+    "worse than not giving one. Save the comfort suggestion for the turn "
+    "after they've actually told you what's wrong.\n\n"
+)
+
+
 def agent(state: AgentState) -> dict:
     """Calls the LLM with the cached system prompt + full chat history.
     The LLM decides whether to call a tool or reply directly.
@@ -339,7 +398,19 @@ def agent(state: AgentState) -> dict:
     target_language = _detect_target_language(state["messages"])
     language_directive = _LANGUAGE_DIRECTIVE.get(target_language, "")
 
-    system_content = language_directive + state["system_prompt"]
+    latest_user_message = ""
+    for msg in reversed(state["messages"]):
+        if getattr(msg, "type", None) == "human":
+            latest_user_message = msg.content
+            break
+
+    no_symptom_directive = (
+        _NO_SYMPTOM_YET_DIRECTIVE
+        if _is_generic_medical_guidance_request(latest_user_message)
+        else ""
+    )
+
+    system_content = language_directive + no_symptom_directive + state["system_prompt"]
 
     if not state.get("greeted"):
         system_content += (
