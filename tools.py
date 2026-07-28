@@ -41,7 +41,6 @@ from config import (
     CANCELLED_STATUS_NAME,
     DEFAULT_COUNTRY_CODE,
     DOCTOR_AVAILABILITY_WINDOW_DAYS,
-    DOCTORS_API_BASE_URL,
     OTP_PROVIDER,
     OTP_TTL_SECONDS,
     TEST_OTP,
@@ -521,8 +520,13 @@ def verify_otp(phone: str, otp: str) -> dict:
 # on a separate port (1102) from GuestBookings (1101). Response shapes
 # confirmed directly from the API's own Swagger "Execute" output.
 
-def _doctors_base_url(state: AgentState) -> str:
-    return (state.get("templates") or {}).get("_doctors_base_url") or DOCTORS_API_BASE_URL
+def _doctors_base_url(state: AgentState) -> Optional[str]:
+    """Returns this client's configured Doctors/Specialties API base_url,
+    or None if it isn't configured for this client at all. Deliberately
+    NEVER falls back to some other client's URL - see config.py's
+    extensive comment on why (a real cross-tenant data leak risk)."""
+
+    return (state.get("templates") or {}).get("_doctors_base_url")
 
 
 @tool
@@ -532,13 +536,22 @@ def list_specialties(state: Annotated[AgentState, InjectedState]) -> dict:
     symptom/concern - never guess whether this clinic has a given
     specialty. Returns:
     {"status": "found", "specialties": [{"id": ..., "name": ...}, ...]}
+    {"status": "not_configured"}  # this clinic doesn't have this feature set up yet
     {"status": "error"}  # the API call itself failed"""
 
     base_url = _doctors_base_url(state)
+
+    if not base_url:
+        logger.warning("list_specialties called but no doctors_base_url is configured for client_id=%s", state.get("client_id"))
+        return {"status": "not_configured"}
+
     result = api.get_specialties(base_url)
 
     if not result["success"]:
-        logger.error("list_specialties API call failed: base_url=%s error=%s", base_url, result.get("error"))
+        logger.error(
+            "list_specialties API call failed: base_url=%s status_code=%s error=%s",
+            base_url, result.get("status_code"), result.get("error"),
+        )
         return {"status": "error"}
 
     items = (result["data"] or {}).get("items", [])
@@ -559,9 +572,14 @@ def find_available_doctors(
     `specialty_id` - never guess or invent one. Returns:
     {"status": "found", "doctors": [{"id", "name", "specialtyName", "degreeName"}, ...]}
     {"status": "not_found"}  # this specialty exists, but no doctor has availability right now
+    {"status": "not_configured"}  # this clinic doesn't have this feature set up yet
     {"status": "error"}  # the API call itself failed"""
 
     base_url = _doctors_base_url(state)
+
+    if not base_url:
+        logger.warning("find_available_doctors called but no doctors_base_url is configured for client_id=%s", state.get("client_id"))
+        return {"status": "not_configured"}
 
     now = datetime.utcnow()
     intersection_start = now.isoformat() + "Z"
@@ -577,7 +595,10 @@ def find_available_doctors(
     )
 
     if not result["success"]:
-        logger.error("find_available_doctors API call failed: base_url=%s specialty_id=%s error=%s", base_url, specialty_id, result.get("error"))
+        logger.error(
+            "find_available_doctors API call failed: base_url=%s specialty_id=%s status_code=%s error=%s",
+            base_url, specialty_id, result.get("status_code"), result.get("error"),
+        )
         return {"status": "error"}
 
     items = (result["data"] or {}).get("items", [])
