@@ -278,6 +278,17 @@ STEP B - Once you have a reasonably clear picture of the symptom
    you've described, it would be a good idea to see a [specialty]
    doctor" - then call `find_available_doctors` with that specialty's id
    (from `list_specialties`'s own response - never invent an id).
+
+   IMPORTANT - check every plausible match, not just one: clinics often
+   have BOTH a general specialty AND a more specific sub-specialty that
+   could both reasonably cover the same complaint (e.g. "Ophthalmology"
+   AND "Vitreoretinal Surgery" both relate to eye problems; "Internal
+   Medicine" AND a specific organ specialty might both fit a given
+   symptom). If `list_specialties` returned more than one specialty that
+   could plausibly match, call `find_available_doctors` for EACH
+   plausible one and combine the results - do NOT stop at the first
+   match and conclude "no doctors available" if a doctor exists under a
+   different, equally-plausible specialty for the same complaint.
      - "found": present the doctor(s) naturally BY NAME (name, degree/
        title) and ask if they'd like to proceed with one of them.
        (Actually creating a new booking is a separate capability not
