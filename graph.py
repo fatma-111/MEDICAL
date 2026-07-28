@@ -113,6 +113,52 @@ _ENGLISH_GREETING_TEMPLATE = (
 )
 
 
+def _normalize_for_compare(text: str) -> str:
+    """Collapse all whitespace (including \\r\\n vs \\n differences) into
+    single spaces, for tolerant text comparison."""
+
+    return re.sub(r"\s+", " ", (text or "").replace("\r", "\n")).strip()
+
+
+def _already_contains_greeting(reply_text: str, greeting: str) -> bool:
+    """
+    Whether `reply_text` already includes the clinic greeting.
+
+    Compares on a NORMALIZED SIGNATURE rather than the full exact text.
+    Requiring an exact full-text match was the cause of a real
+    production bug: the CSV greeting had \\r\\n line endings while the
+    LLM's own reproduction of it used \\n, so the exact check failed and
+    a second copy of the greeting was prepended to a reply that already
+    contained one.
+
+    The signature is the greeting's longest early line (usually the
+    persona line, e.g. "أنا لطيفة، المساعدة الافتراضية في مستشفى ...") -
+    distinctive enough that a false positive is very unlikely, and
+    tolerant of cosmetic differences elsewhere in the message.
+    """
+
+    normalized_reply = _normalize_for_compare(reply_text)
+    normalized_greeting = _normalize_for_compare(greeting)
+
+    if not normalized_greeting:
+        return False
+
+    if normalized_greeting in normalized_reply:
+        return True
+
+    # Fall back to the most distinctive single line of the greeting.
+    candidate_lines = [
+        _normalize_for_compare(line)
+        for line in greeting.replace("\r", "\n").split("\n")[:4]
+    ]
+    signature = max((line for line in candidate_lines if line), key=len, default="")
+
+    if len(signature) >= 20 and signature in normalized_reply:
+        return True
+
+    return False
+
+
 def _build_greeting(templates: dict, user_message: str, target_language: str) -> str:
     """
     Build the deterministic opening greeting for this conversation.
@@ -148,6 +194,17 @@ def _build_greeting(templates: dict, user_message: str, target_language: str) ->
     greeting = templates.get("msg_unknown_fallback")
     if not greeting:
         return ""
+
+    # Normalize line endings FIRST. The CSV can arrive with \r\n (Excel/
+    # Git on Windows often rewrite it that way), while the LLM, when it
+    # reproduces the same greeting from the system prompt, emits plain
+    # \n. That mismatch made the "did the model already include the
+    # greeting?" check in agent() fail, so a second copy got prepended -
+    # the actual root cause of the duplicated greeting seen in
+    # production (the two copies in the log differed ONLY in line
+    # endings). Normalizing here fixes both the comparison and the text
+    # we emit.
+    greeting = greeting.replace("\r\n", "\n").replace("\r", "\n")
 
     return _personalized_greeting(greeting, user_message, target_language)
 
@@ -318,7 +375,7 @@ def agent(state: AgentState) -> dict:
         first_user_message = state["messages"][0].content if state["messages"] else ""
         greeting = _build_greeting(state.get("templates") or {}, first_user_message, target_language or "ar")
 
-        if greeting and greeting.strip() not in (response.content or ""):
+        if greeting and not _already_contains_greeting(response.content or "", greeting):
             combined = f"{greeting.strip()}\n\n{response.content}".strip() if response.content else greeting.strip()
             response = AIMessage(content=combined)
 
