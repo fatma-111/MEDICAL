@@ -101,14 +101,27 @@ REQUEST_TIMEOUT_SECONDS: float = float(
 # ==========================================================
 #
 # Confirmed by the user directly: this is a SEPARATE service from
-# GuestBookings, on port 1102 (GuestBookings is on 1101). The base_url
-# alone is enough to scope results to the correct clinic (same as
-# GuestBookings) - confirmed directly, no separate organizationId/
-# branchId filtering is needed.
+# GuestBookings, on port 1102 (GuestBookings is on 1101), AND each
+# clinic has its OWN different Doctors/Specialties API - confirmed
+# directly (tanasuq-saudi's is not the same as Dar El Oyoun-demo's).
+#
+# CRITICAL: there is deliberately NO hardcoded fallback URL here anymore.
+# An earlier version defaulted to tanasuq's confirmed URL for every
+# client that didn't have its own configured - which meant any OTHER
+# client (e.g. Dar El Oyoun-demo, before its own URL was known) would
+# silently query TANASUQ's API and could have ended up suggesting
+# Tanasuq's doctors/specialties to a Dar El Oyoun conversation. That is
+# a real cross-tenant data leak risk, not just a cosmetic bug - so the
+# resolution order is now:
+#   1. DOCTORS_API_BASE_URL env var, IF explicitly set (an intentional,
+#      explicit override for ALL clients - e.g. a single-tenant deploy).
+#   2. client_config.csv's "doctors_base_url" column for the resolved
+#      client_id.
+#   3. None - tools.py's list_specialties/find_available_doctors treat
+#      this as "not_configured" and say so honestly, rather than ever
+#      falling back to some other client's URL.
 
-DOCTORS_API_BASE_URL: str = os.getenv(
-    "DOCTORS_API_BASE_URL", "https://demo.catalystsystems.io:1102"
-)
+_ENV_DOCTORS_BASE_URL_OVERRIDE: Optional[str] = os.getenv("DOCTORS_API_BASE_URL") or None
 
 # How many days ahead to search for doctor availability by default, when
 # the user doesn't specify a particular day - see
@@ -394,6 +407,7 @@ def get_messages(client_id: str, dialect: Optional[str] = None) -> dict:
     merged["_agent_name"] = client_row.get("agent_name")
     merged["_agent_name_ar"] = client_row.get("agent_name_ar")
     merged["_base_url"] = _ENV_BASE_URL_OVERRIDE or client_row.get("base_url") or BASE_URL
+    merged["_doctors_base_url"] = _ENV_DOCTORS_BASE_URL_OVERRIDE or client_row.get("doctors_base_url") or None
     merged["_phone_example"] = client_row.get("phone_example")
     merged["_country_codes_hint"] = client_row.get("country_codes_hint")
     merged["_dialect_name"] = effective_dialect
