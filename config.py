@@ -1,0 +1,404 @@
+"""
+Central configuration for the Guest Booking Cancellation Agent.
+
+All environment-dependent values live here so that services/nodes never
+hardcode URLs, credentials, tunable settings, or CSV paths directly.
+
+This module is also responsible for loading and merging the two
+multi-tenant reference-data files exported alongside the n8n workflow:
+
+  - data/client_config.csv       (per-clinic branding, routing, and a
+                                   PARTIAL set of message-template overrides)
+  - data/dialect_templates.csv   (per-Arabic-dialect DEFAULT message
+                                   templates and conversational behavior
+                                   strings)
+
+In the original n8n workflow these were read by two nodes referenced from
+the agent's system prompt ("Get Client Config" / "Get Dialect Templates")
+that were not included in the exported workflow JSON. We reproduce their
+effect here: client_config values win when present, otherwise the
+client's dialect row in dialect_templates.csv supplies the default. This
+was confirmed by inspecting both files - client_config.csv only defines 8
+of the ~27 msg_*/behavior keys; everything else (msg_cancellation_confirmation,
+msg_cancel_success, msg_phone_number_ask, msg_booking_refrence, ...) only
+exists in dialect_templates.csv.
+"""
+
+import csv
+import logging
+import os
+from functools import lru_cache
+from pathlib import Path
+from typing import Dict, List, Optional
+
+from dotenv import load_dotenv
+
+# ==========================================================
+# .env loading (Part 4 - OpenAI key / dotenv best practice)
+# ==========================================================
+#
+# Resolved by absolute path (PROJECT_ROOT), NOT by relying on the current
+# working directory - this must work identically whether launched via
+# `python main.py` from anywhere, `pytest`, `langgraph dev`, or on
+# LangGraph Platform (which may invoke the module from a different cwd
+# than the repo root).
+
+_PROJECT_ROOT_FOR_ENV = Path(__file__).resolve().parent
+load_dotenv(_PROJECT_ROOT_FOR_ENV / ".env")
+
+# ==========================================================
+# Paths
+# ==========================================================
+
+PROJECT_ROOT: Path = _PROJECT_ROOT_FOR_ENV
+
+DATA_DIR: Path = Path(os.getenv("AGENT_DATA_DIR", str(PROJECT_ROOT / "data")))
+
+# Candidate directories searched, in order, for each CSV filename below.
+# This is the actual fix for the "Config CSV not found" warning: the
+# loader no longer assumes the CSVs live in exactly one place. It checks
+# AGENT_DATA_DIR/data/ first (the documented, recommended location), then
+# falls back to the project root itself (where these two files currently
+# are, per the uploaded project). Both are resolved from __file__, never
+# from os.getcwd(), so this is unaffected by which directory a process is
+# launched from - locally, under `langgraph dev`, or on LangGraph
+# Platform.
+_CANDIDATE_DATA_DIRS: List[Path] = [DATA_DIR, PROJECT_ROOT]
+
+CLIENT_CONFIG_CSV: Path = DATA_DIR / "client_config.csv"
+DIALECT_TEMPLATES_CSV: Path = DATA_DIR / "dialect_templates.csv"
+
+
+# ==========================================================
+# Booking API
+# ==========================================================
+#
+# Precedence (highest wins), per the Railway/n8n deployment requirements:
+#   1. BOOKING_API_BASE_URL environment variable, IF explicitly set
+#   2. client_config.csv's "base_url" column for the resolved client_id
+#   3. _DEFAULT_BASE_URL below (hardcoded fallback)
+#
+# _ENV_BASE_URL_OVERRIDE is None when the env var isn't set at all
+# (as opposed to BASE_URL below, which always has a value via its
+# os.getenv(..., default) - we need to distinguish "not set" from "set
+# to the default" to know whether the env var should override the CSV).
+
+_DEFAULT_BASE_URL: str = "https://demo.catalystsystems.io:1101"
+
+_ENV_BASE_URL_OVERRIDE: Optional[str] = os.getenv("BOOKING_API_BASE_URL") or None
+
+BASE_URL: str = _ENV_BASE_URL_OVERRIDE or _DEFAULT_BASE_URL
+
+CLIENT_ID_HEADER: str = "ClientId"
+
+REQUEST_TIMEOUT_SECONDS: float = float(
+    os.getenv("BOOKING_API_TIMEOUT_SECONDS", "15")
+)
+
+
+# ==========================================================
+# Doctors / Specialties API (Medical Concierge feature)
+# ==========================================================
+#
+# Confirmed by the user directly: this is a SEPARATE service from
+# GuestBookings, on port 1102 (GuestBookings is on 1101). The base_url
+# alone is enough to scope results to the correct clinic (same as
+# GuestBookings) - confirmed directly, no separate organizationId/
+# branchId filtering is needed.
+
+DOCTORS_API_BASE_URL: str = os.getenv(
+    "DOCTORS_API_BASE_URL", "https://demo.catalystsystems.io:1102"
+)
+
+# How many days ahead to search for doctor availability by default, when
+# the user doesn't specify a particular day - see
+# tools.find_available_doctors().
+DOCTOR_AVAILABILITY_WINDOW_DAYS: int = int(
+    os.getenv("DOCTOR_AVAILABILITY_WINDOW_DAYS", "14")
+)
+
+
+
+# ==========================================================
+# Booking Status
+# ==========================================================
+#
+# f_cancel_appointment.json checks statusName == "Cancelled" before
+# cancelling (idempotency guard). f_lookup_appointment.json's phone-path
+# filter excludes numeric status == 6 (Cancelled) when computing "active"
+# bookings. Both are preserved as named constants rather than magic
+# literals scattered through node.py.
+
+CANCELLED_STATUS_NAME: str = "Cancelled"
+CANCELLED_STATUS_CODE: int = 6
+
+# Official numeric status codes, confirmed directly from the Booking
+# API's own documentation - these replace the earlier fragile approach
+# of matching statusName strings (which had to handle both English AND
+# Arabic spellings depending on the accept-language header, and broke at
+# least once in practice). Numeric codes are language-independent.
+STATUS_NEW: int = 1
+STATUS_CONFIRMED: int = 2
+STATUS_ARRIVED: int = 3
+STATUS_NO_SHOW: int = 4
+STATUS_COMPLETED: int = 5
+STATUS_CANCELLED: int = 6
+
+# Only these two are cancellable - confirmed directly from the
+# dashboard's own status dropdown (جديد/تم التأكيد were the only ones NOT
+# excluded; وصل/لم يحضر/مكتمل/ملغي were all excluded).
+CANCELLABLE_STATUS_CODES = (STATUS_NEW, STATUS_CONFIRMED)
+
+# Statuses considered cancellable by build_response / check_booking_status.
+# The original sub-workflows only ever check for "already Cancelled" (not
+# an explicit allow-list), so this defaults permissive: anything that
+# isn't already Cancelled is treated as cancellable, and the API call
+# itself is the final authority (its own error response wins either way).
+CANCELLABLE_STATUSES = ("New", "Confirmed")
+
+
+# ==========================================================
+# Timezone conversion (f_lookup_appointment.json "toRiyadh" code nodes)
+# ==========================================================
+
+BOOKING_TIME_UTC_OFFSET_HOURS: int = 3  # UTC -> Asia/Riyadh, matches n8n Code nodes
+
+
+# ==========================================================
+# OTP Settings
+# ==========================================================
+#
+# Two providers are supported, selected by OTP_PROVIDER:
+#   "dummy"       -> mirrors OTP_Dummy_send.json / OTP_Dummy_verify.json
+#                    (always succeeds; TEST_OTP is accepted as correct)
+#   "authentica"  -> mirrors send_otp5 / verify_otp5 in
+#                    langchain_cancellation.json (api.authentica.sa)
+# Defaults to "dummy" so the project runs end-to-end with no external
+# OTP credentials, exactly like the n8n dev setup that ships both a real
+# and a dummy OTP sub-workflow side by side.
+
+OTP_PROVIDER: str = os.getenv("OTP_PROVIDER", "dummy")
+
+TEST_OTP: str = os.getenv("TEST_OTP", "123456")
+OTP_LENGTH: int = 6
+OTP_TTL_SECONDS: int = 5 * 60  # 5 minutes
+
+AUTHENTICA_BASE_URL: str = os.getenv(
+    "AUTHENTICA_BASE_URL", "http://api.authentica.sa/api/v2"
+)
+AUTHENTICA_API_KEY: str = os.getenv("AUTHENTICA_API_KEY", "")
+AUTHENTICA_TEMPLATE_ID: str = os.getenv("AUTHENTICA_TEMPLATE_ID", "31")
+AUTHENTICA_FALLBACK_EMAIL: str = os.getenv("AUTHENTICA_FALLBACK_EMAIL", "")
+
+
+# ==========================================================
+# Default Country / Phone Normalization
+# ==========================================================
+
+DEFAULT_COUNTRY_CODE: str = os.getenv("DEFAULT_COUNTRY_CODE", "20")  # Egypt
+
+
+# ==========================================================
+# Retry limits (bounded interrupt loops - see graph.py)
+# ==========================================================
+#
+# Every node that can loop back to itself via an interrupt (phone-format
+# retry, OTP retry, selection retry, confirmation retry) is bounded by one
+# of these, so a confused caller is routed to a handoff message
+# (client_config's msg_handoff_confirmation) instead of looping forever.
+
+MAX_PHONE_FORMAT_RETRIES: int = 3
+MAX_OTP_RETRIES: int = 3
+MAX_SELECTION_RETRIES: int = 3
+MAX_CONFIRMATION_RETRIES: int = 2
+
+
+# ==========================================================
+# LangGraph / Thread Settings
+# ==========================================================
+
+THREAD_ID_PREFIX: str = "guest-cancel"
+
+# After this many seconds of no message on a given session_id, the next
+# message starts a completely fresh conversation (new thread_id) instead
+# of resuming the old one - see main.py's send_message().
+SESSION_TIMEOUT_SECONDS: int = int(os.getenv("SESSION_TIMEOUT_SECONDS", "3600"))  # 1 hour
+
+# Shorter grace period specifically after a cancellation completes
+# successfully: if no follow-up message arrives within this window, the
+# NEXT message starts fresh. A follow-up within this window continues
+# the same conversation as normal (no repeated greeting). See main.py's
+# _config_for()/_cancellation_just_succeeded().
+POST_SUCCESS_TIMEOUT_SECONDS: int = int(os.getenv("POST_SUCCESS_TIMEOUT_SECONDS", "600"))  # 10 minutes
+
+
+# ==========================================================
+# OpenAI (language/dialect detection, ref/phone extraction, selection
+# matching - the only three LLM touchpoints in the hybrid design)
+# ==========================================================
+
+OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-4.1")  # upgraded from gpt-4.1-mini for better dialect/persona instruction-following
+OPENAI_TIMEOUT_SECONDS: float = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "10"))
+
+# LLM classification is only attempted if an API key is present. Without
+# one, prompts.py's callers fall back to deterministic heuristics so the
+# agent still runs (e.g. local dev / tests / this sandbox, which has no
+# outbound access to api.openai.com).
+LLM_CLASSIFICATION_ENABLED: bool = bool(OPENAI_API_KEY)
+
+
+# ==========================================================
+# Logging
+# ==========================================================
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+
+
+def configure_logging() -> None:
+    """Configure root logging once for the whole application."""
+
+    logging.basicConfig(
+        level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
+        format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    )
+
+
+logger = logging.getLogger(__name__)
+
+
+# ==========================================================
+# client_config.csv / dialect_templates.csv loading
+# ==========================================================
+
+# Keys present in BOTH files. For these, client_config.csv (when the
+# client has a non-empty value) takes precedence over the dialect
+# default. Verified against both CSV headers.
+_CLIENT_OVERRIDE_KEYS = (
+    "msg_unknown_fallback",
+    "msg_media_canned",
+    "msg_handoff_confirmation",
+    "msg_back_to_ai",
+    "msg_patient_booking_number",
+    "msg_booking_confirmation",
+    "msg_booking_success",
+    "msg_On_failure",
+)
+
+
+def _resolve_data_file(filename: str) -> Optional[Path]:
+    """Search _CANDIDATE_DATA_DIRS in order for `filename`. Returns the
+    first match, or None if it isn't found in any candidate location."""
+
+    for directory in _CANDIDATE_DATA_DIRS:
+        candidate = directory / filename
+        if candidate.exists():
+            return candidate
+
+    return None
+
+
+def _read_csv_rows(filename: str) -> list:
+    """Read a CSV (UTF-8 with BOM) into a list of dict rows, searching
+    _CANDIDATE_DATA_DIRS for `filename`. Returns an empty list (with a
+    warning naming every path that was tried) if it isn't found anywhere,
+    so callers can fall back to built-in defaults rather than crashing."""
+
+    resolved = _resolve_data_file(filename)
+
+    if resolved is None:
+        tried = ", ".join(str(d / filename) for d in _CANDIDATE_DATA_DIRS)
+        logger.warning("Config CSV '%s' not found. Tried: %s", filename, tried)
+        return []
+
+    with open(resolved, encoding="utf-8-sig", newline="") as f:
+        return list(csv.DictReader(f))
+
+
+@lru_cache(maxsize=1)
+def _all_client_configs() -> Dict[str, dict]:
+    """client_id -> row dict, loaded once and cached."""
+
+    rows = _read_csv_rows("client_config.csv")
+    return {row["client_id"]: row for row in rows if row.get("client_id")}
+
+
+@lru_cache(maxsize=1)
+def _all_dialect_templates() -> Dict[str, dict]:
+    """Dialect name (as written in the CSV, e.g. "Egyptian") -> row dict,
+    loaded once and cached."""
+
+    rows = _read_csv_rows("dialect_templates.csv")
+    return {row["Dialect"].strip(): row for row in rows if row.get("Dialect")}
+
+
+def get_client_config(client_id: str) -> Optional[dict]:
+    """Return the raw client_config.csv row for `client_id`, or None if
+    that client isn't configured."""
+
+    return _all_client_configs().get(client_id)
+
+
+def get_dialect_template(dialect: str) -> Optional[dict]:
+    """Return the raw dialect_templates.csv row for `dialect` (e.g.
+    "Egyptian", "Saudi"), or None if that dialect isn't configured."""
+
+    if not dialect:
+        return None
+
+    # dialect_templates.csv has at least one row with trailing whitespace
+    # in its Dialect column ("Saudi ") - normalize both sides.
+    target = dialect.strip().lower()
+    for name, row in _all_dialect_templates().items():
+        if name.strip().lower() == target:
+            return row
+
+    return None
+
+
+def get_messages(client_id: str, dialect: Optional[str] = None) -> dict:
+    """
+    Build the merged message-template dict used by build_response and the
+    system prompt equivalent throughout the graph.
+
+    Resolution order:
+      1. Start with the dialect row for `dialect`, or the client's own
+         `Dialect` column from client_config.csv if `dialect` isn't given.
+      2. Overlay any non-empty client_config.csv values for the keys both
+         files define (_CLIENT_OVERRIDE_KEYS).
+
+    Returns a plain dict (never raises); missing config degrades to an
+    empty dict, and format_message()'s own built-in English/Arabic
+    fallback strings (utils/formatter equivalent in prompts.py) take over
+    from there.
+    """
+
+    client_row = get_client_config(client_id) or {}
+
+    effective_dialect = dialect or client_row.get("Dialect")
+
+    dialect_row = get_dialect_template(effective_dialect) or {}
+
+    merged = dict(dialect_row)
+
+    for key in _CLIENT_OVERRIDE_KEYS:
+        value = client_row.get(key)
+        if value:
+            merged[key] = value
+
+    # A few non-message fields nodes/prompts need directly, not just for
+    # templating - kept alongside the message dict so callers only need
+    # one merged object per (client_id, dialect) pair.
+    merged["_clinic_name"] = client_row.get("clinic_name")
+    merged["_clinic_name_ar"] = client_row.get("clinic_name_ar")
+    merged["_agent_name"] = client_row.get("agent_name")
+    merged["_agent_name_ar"] = client_row.get("agent_name_ar")
+    merged["_base_url"] = _ENV_BASE_URL_OVERRIDE or client_row.get("base_url") or BASE_URL
+    merged["_phone_example"] = client_row.get("phone_example")
+    merged["_country_codes_hint"] = client_row.get("country_codes_hint")
+    merged["_dialect_name"] = effective_dialect
+    merged["_dialect_instruction"] = dialect_row.get("dialect_instruction") or client_row.get(
+        "dialect_instruction"
+    )
+
+    return merged
