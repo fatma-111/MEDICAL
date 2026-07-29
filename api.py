@@ -369,3 +369,130 @@ def get_doctors(
         payload["intersectionEnd"] = intersection_end
 
     return _post_json(url, payload, client_id=client_id)
+
+
+# ==========================================================
+# Doctor Schedule / Reschedule (Reschedule Appointment feature)
+# ==========================================================
+#
+# All three endpoints confirmed directly from the API's own Swagger
+# "Execute" output, same demo server/port as Doctors/Specialties.
+
+def get_doctor_schedule(
+    base_url: str,
+    doctor_ids: list,
+    page_size: int = 50,
+    client_id: Optional[str] = None,
+) -> dict:
+    """POST {base_url}/api/DoctorSchedules/GetList.
+
+    Returns the doctor's GENERAL RECURRING schedule (which weekdays they
+    work, and their daily start/end times, and the date range this
+    schedule is valid for) - NOT specific available time slots. Each
+    item has recurringDaysNames/fromDateTime/toDateTime among other
+    fields (confirmed directly from the API's real response)."""
+
+    url = f"{base_url}/api/DoctorSchedules/GetList"
+    payload = {"pageNumber": 1, "pageSize": page_size, "doctorIds": doctor_ids}
+
+    return _post_json(url, payload, client_id=client_id)
+
+
+def get_doctor_schedule_slots(
+    base_url: str,
+    doctor_ids: list,
+    from_date: str,
+    to_date: str,
+    is_booked: bool = False,
+    page_size: int = 200,
+    client_id: Optional[str] = None,
+) -> dict:
+    """POST {base_url}/api/Doctors/GetDoctorScheduleSlots.
+
+    Returns SPECIFIC time slots within [from_date, to_date] - the actual
+    bookable times, not just working days. `is_booked=False` (default)
+    filters to only slots that are NOT already taken - i.e. genuinely
+    available ones. Each item has slotStart/slotEnd/isBooked among other
+    fields (confirmed directly from the API's real response)."""
+
+    url = f"{base_url}/api/Doctors/GetDoctorScheduleSlots"
+    payload = {
+        "pageNumber": 1,
+        "pageSize": page_size,
+        "fromDate": from_date,
+        "toDate": to_date,
+        "isBooked": is_booked,
+        "doctorIds": doctor_ids,
+    }
+
+    return _post_json(url, payload, client_id=client_id)
+
+
+def _put_json(url: str, payload: dict, client_id: Optional[str] = None) -> dict:
+    """Generic PUT + envelope handling, mirroring _post_json exactly but
+    for the one confirmed PUT endpoint (GuestBookings/Update)."""
+
+    logger.debug("PUT %s payload=%s", url, payload)
+
+    try:
+        response = requests.put(
+            url,
+            json=payload,
+            headers=_headers(client_id=client_id),
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+    except requests.Timeout:
+        logger.warning("Request timed out: %s", url)
+        return _result(False, error="timeout")
+    except requests.RequestException as exc:
+        logger.exception("Request failed: %s", url)
+        return _result(False, error=str(exc))
+
+    if response.status_code >= 500:
+        logger.error("GuestBookings/Update server error: %s status=%s body=%s", url, response.status_code, response.text[:1000])
+        return _result(False, response.status_code, error="server_error")
+
+    if response.status_code == 404:
+        logger.error("GuestBookings/Update endpoint NOT FOUND (404): %s body=%s", url, response.text[:500])
+        return _result(False, response.status_code, error="endpoint_not_found")
+
+    if response.status_code >= 400:
+        logger.error("GuestBookings/Update validation error: %s status=%s body=%s", url, response.status_code, response.text[:1000])
+        return _result(False, response.status_code, error="validation_error")
+
+    try:
+        body = response.json()
+    except ValueError:
+        return _result(False, response.status_code, error="invalid_json_response")
+
+    if not body:
+        return _result(False, response.status_code, error="empty_response")
+
+    if not body.get("isSuccess"):
+        return _result(False, response.status_code, data=body, error="api_reported_failure")
+
+    return _result(True, response.status_code, data=body.get("data", {}))
+
+
+def reschedule_booking(
+    base_url: str,
+    booking_id: str,
+    new_from: str,
+    new_to: str,
+    client_id: Optional[str] = None,
+) -> dict:
+    """PUT {base_url}/api/GuestBookings/Update.
+
+    Changes an EXISTING booking's time. `booking_id` is the booking's own
+    GUID `id` field (NOT the human-readable bookingRefNum) - confirmed
+    directly from the API's real request schema: {"id", "fromBookingTime",
+    "toBookingTime"}."""
+
+    url = f"{base_url}/api/GuestBookings/Update"
+    payload = {
+        "id": booking_id,
+        "fromBookingTime": new_from,
+        "toBookingTime": new_to,
+    }
+
+    return _put_json(url, payload, client_id=client_id)
