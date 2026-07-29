@@ -139,6 +139,7 @@ _FIELD_MAP = (
     ("statusName", ("statusName",)),
     ("branchName", ("branchName",)),
     ("doctorName", ("doctorName",)),
+    ("doctorId", ("doctorId",)),
     ("serviceName", ("serviceName",)),
     ("specialtyName", ("specialtyName",)),
 )
@@ -694,6 +695,189 @@ def find_available_doctors(
     return {"status": "found", "doctors": doctors}
 
 
+# ==========================================================
+# Reschedule Appointment (change an existing booking's time)
+# ==========================================================
+#
+# Reuses lookup_appointment/compare_phone/send_otp/verify_otp exactly
+# as-is for identifying the booking and verifying identity - see
+# prompts.py's RESCHEDULE FLOW, which mirrors the same STEP 1-3 logic
+# already used for cancellation. These three tools cover what's new:
+# checking the doctor's schedule/availability and performing the update.
+
+def _resolve_doctor_id(state: AgentState, ref_number: str, language: Optional[str]) -> dict:
+    """Internal helper: look up a booking by its reference number and
+    return its doctorId, so schedule/slot tools know which doctor to
+    query without the LLM ever having to know or pass a doctor's GUID
+    directly. Returns {"status": "found", "doctor_id": ...} or an error
+    status matching lookup_appointment's own conventions."""
+
+    base_url = _base_url(state)
+    result = api.get_bookings_by_ref(base_url, ref_number, language=language)
+
+    if not result["success"]:
+        logger.error("_resolve_doctor_id: API call failed for ref_number=%s error=%s", ref_number, result.get("error"))
+        return {"status": "error"}
+
+    items = (result["data"] or {}).get("items", [])
+    if not items:
+        return {"status": "not_found"}
+
+    doctor_id = items[0].get("doctorId")
+    if not doctor_id:
+        logger.warning("_resolve_doctor_id: booking found but has no doctorId - ref_number=%s", ref_number)
+        return {"status": "error"}
+
+    return {"status": "found", "doctor_id": doctor_id}
+
+
+@tool
+def get_doctor_schedule(
+    state: Annotated[AgentState, InjectedState],
+    ref_number: str,
+    language: str = "en",
+) -> dict:
+    """Get the GENERAL RECURRING weekly schedule of the doctor on a given
+    booking - which weekdays they work, their daily start/end times, and
+    the date range this schedule is valid for. Call this BEFORE offering
+    to reschedule, to know which days of the week are even worth
+    checking - this does NOT return specific open time slots (use
+    `get_available_reschedule_slots` for that once you've picked a
+    target date). Returns:
+    {"status": "found", "schedules": [{"recurringDaysNames": [...], "fromDateTime": ..., "toDateTime": ...}, ...]}
+    {"status": "not_found"}  # booking or schedule doesn't exist
+    {"status": "not_configured"}  # this clinic doesn't have this feature set up yet
+    {"status": "error"}"""
+
+    resolved = _resolve_doctor_id(state, ref_number, language)
+    if resolved["status"] != "found":
+        return resolved
+
+    base_url = _doctors_base_url(state)
+
+    if not base_url:
+        logger.warning("get_doctor_schedule called but no doctors_base_url is configured for client_id=%s", state.get("client_id"))
+        return {"status": "not_configured"}
+
+    result = api.get_doctor_schedule(base_url, doctor_ids=[resolved["doctor_id"]])
+
+    if not result["success"]:
+        logger.error("get_doctor_schedule API call failed: status_code=%s error=%s", result.get("status_code"), result.get("error"))
+        return {"status": "error"}
+
+    items = (result["data"] or {}).get("items", [])
+    if not items:
+        return {"status": "not_found"}
+
+    schedules = [
+        {
+            "recurringDaysNames": item.get("recurringDaysNames"),
+            "fromDateTime": to_riyadh(item.get("fromDateTime")),
+            "toDateTime": to_riyadh(item.get("toDateTime")),
+        }
+        for item in items
+    ]
+
+    return {"status": "found", "schedules": schedules}
+
+
+@tool
+def get_available_reschedule_slots(
+    state: Annotated[AgentState, InjectedState],
+    ref_number: str,
+    from_date: str,
+    to_date: str,
+    language: str = "en",
+) -> dict:
+    """Get the doctor's ACTUAL open time slots (not just working days)
+    for the booking's doctor, within [from_date, to_date] - both in ISO
+    format, e.g. "2026-05-01T09:00:00+03:00". Only genuinely available
+    (not already booked) slots are returned. Call `get_doctor_schedule`
+    first to know which weekdays/hours are worth checking, then call
+    this with a specific day's full working-hours range to see the
+    exact bookable times. Returns:
+    {"status": "found", "slots": [{"slotStart": ..., "slotEnd": ..., "date_display": ..., "time_display": ..., "doctorName": ..., "serviceName": ..., "servicePrice": ...}, ...]}
+    {"status": "not_found"}  # no open slots in this range
+    {"status": "not_configured"}  # this clinic doesn't have this feature set up yet
+    {"status": "error"}"""
+
+    resolved = _resolve_doctor_id(state, ref_number, language)
+    if resolved["status"] != "found":
+        return resolved
+
+    base_url = _doctors_base_url(state)
+
+    if not base_url:
+        logger.warning("get_available_reschedule_slots called but no doctors_base_url is configured for client_id=%s", state.get("client_id"))
+        return {"status": "not_configured"}
+
+    result = api.get_doctor_schedule_slots(
+        base_url, doctor_ids=[resolved["doctor_id"]],
+        from_date=from_date, to_date=to_date, is_booked=False,
+    )
+
+    if not result["success"]:
+        logger.error("get_available_reschedule_slots API call failed: status_code=%s error=%s", result.get("status_code"), result.get("error"))
+        return {"status": "error"}
+
+    items = (result["data"] or {}).get("items", [])
+    if not items:
+        return {"status": "not_found"}
+
+    slots = []
+    for item in items:
+        slot_start = to_riyadh(item.get("slotStart"))
+        slot_end = to_riyadh(item.get("slotEnd"))
+        slots.append({
+            "slotStart": slot_start,
+            "slotEnd": slot_end,
+            "date_display": _display_date(slot_start),
+            "time_display": _display_time_12h(slot_start),
+            "doctorName": item.get("doctorName"),
+            "serviceName": item.get("serviceName"),
+            "servicePrice": item.get("servicePrice"),
+        })
+
+    return {"status": "found", "slots": slots}
+
+
+@tool
+def reschedule_appointment(
+    state: Annotated[AgentState, InjectedState],
+    booking_id: str,
+    new_time_from: str,
+    new_time_to: str,
+) -> dict:
+    """Change an existing booking to a new time. `booking_id` MUST be the
+    booking's own "id" field (a GUID) from a FRESH `lookup_appointment`
+    or `check_booking_status` call in THIS conversation - never invent
+    or reuse an old value from memory. `new_time_from`/`new_time_to` must
+    be the EXACT slotStart/slotEnd values from `get_available_reschedule_slots`
+    - never modify or recompute them yourself. Returns:
+    {"status": "success"} or {"status": "error"}"""
+
+    # NOTE: confirmed directly from the user's own curl - GuestBookings/Update
+    # lives on the SAME port as Doctors/Specialties (1302), NOT the regular
+    # GuestBookings port used for cancellation (1101), despite the "GuestBookings"
+    # name. Trusting the confirmed URL over the path-name convention.
+    base_url = _doctors_base_url(state)
+
+    if not base_url:
+        logger.warning("reschedule_appointment called but no doctors_base_url is configured for client_id=%s", state.get("client_id"))
+        return {"status": "error"}
+
+    result = api.reschedule_booking(base_url, booking_id, new_time_from, new_time_to)
+
+    if not result["success"]:
+        logger.error(
+            "reschedule_appointment API call failed: booking_id=%s status_code=%s error=%s",
+            booking_id, result.get("status_code"), result.get("error"),
+        )
+        return {"status": "error"}
+
+    return {"status": "success"}
+
+
 ALL_TOOLS = [
     validate_phone_format,
     compare_phone,
@@ -704,4 +888,7 @@ ALL_TOOLS = [
     verify_otp,
     list_specialties,
     find_available_doctors,
+    get_doctor_schedule,
+    get_available_reschedule_slots,
+    reschedule_appointment,
 ]
