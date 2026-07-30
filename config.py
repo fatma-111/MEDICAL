@@ -83,7 +83,7 @@ DIALECT_TEMPLATES_CSV: Path = DATA_DIR / "dialect_templates.csv"
 # os.getenv(..., default) - we need to distinguish "not set" from "set
 # to the default" to know whether the env var should override the CSV).
 
-_DEFAULT_BASE_URL: str = "https://demo.catalystsystems.io:1302"
+_DEFAULT_BASE_URL: str = "https://demo.catalystsystems.io:1102"
 
 _ENV_BASE_URL_OVERRIDE: Optional[str] = os.getenv("BOOKING_API_BASE_URL") or None
 
@@ -101,7 +101,7 @@ REQUEST_TIMEOUT_SECONDS: float = float(
 # ==========================================================
 #
 # Confirmed by the user directly: this is a SEPARATE service from
-# GuestBookings, on port 1302 (GuestBookings is on 1101), AND each
+# GuestBookings, on port 1102 (GuestBookings is on 1101), AND each
 # clinic has its OWN different Doctors/Specialties API - confirmed
 # directly (tanasuq-saudi's is not the same as Dar El Oyoun-demo's).
 #
