@@ -29,6 +29,7 @@ import logging
 import re
 import time
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import Annotated, Dict, Optional
 
 from langchain_core.tools import tool
@@ -36,7 +37,7 @@ from langgraph.prebuilt import InjectedState
 
 import api
 from config import (
-    BOOKING_TIME_UTC_OFFSET_HOURS,
+    DEFAULT_TIMEZONE,
     CANCELLABLE_STATUS_CODES,
     CANCELLED_STATUS_NAME,
     DEFAULT_COUNTRY_CODE,
@@ -81,27 +82,41 @@ def _is_valid_phone_format(phone: Optional[str]) -> bool:
     return bool(re.match(r"^\+\d{7,15}$", phone.strip()))
 
 
-def to_riyadh(utc_string: Optional[str]) -> Optional[str]:
-    """ISO string -> Asia/Riyadh (+3h) ISO string.
+def to_riyadh(utc_string: Optional[str], timezone_name: str = DEFAULT_TIMEZONE) -> Optional[str]:
+    """ISO string -> the CLIENT'S OWN local time zone, as an ISO string.
 
-    CRITICAL FIX: this used to blindly append the literal string "+03:00"
-    to whatever `.isoformat()` produced, regardless of whether the parsed
-    datetime already had a timezone offset attached. If the input was
-    ALREADY timezone-aware (e.g. "2026-08-06T16:00:00+00:00" - confirmed
-    directly from the real Doctors/GetDoctorScheduleSlots API response),
-    that produced a doubled, invalid offset like
-    "2026-08-06T19:00:00+00:00+03:00" - which is exactly what caused a
-    real production 400 error from GuestBookings/Update (it received an
-    unparseable timestamp). Now: if the input is timezone-aware, convert
-    it to the Riyadh offset properly via astimezone(); if it's naive
-    (no offset in the string at all), assume it's UTC and attach the
-    Riyadh offset directly on the datetime object - never by string
-    concatenation."""
+    Despite the historical name (kept to minimize churn - this function
+    used to be Riyadh-only), `timezone_name` is now a real per-client
+    IANA zone name (e.g. "Africa/Cairo", "Asia/Riyadh" - both are real
+    values already present in client_config.csv's own "timezone" column,
+    exposed as state["templates"]["_timezone"]). This replaces a single
+    hardcoded "+3 hours" that used to be applied to every clinic
+    regardless of its actual location, which would have silently
+    produced wrong times for any clinic outside Saudi Arabia, and
+    doesn't account for DST where applicable.
+
+    CRITICAL FIX (kept from the previous version): this used to blindly
+    append a literal offset string to whatever `.isoformat()` produced,
+    regardless of whether the parsed datetime was already timezone-aware.
+    If the input was ALREADY timezone-aware (e.g.
+    "2026-08-06T16:00:00+00:00" - confirmed directly from the real
+    Doctors/GetDoctorScheduleSlots API response), that produced a
+    doubled, invalid offset like "2026-08-06T19:00:00+00:00+03:00" -
+    which caused a real production 400 error from GuestBookings/Update
+    (it received an unparseable timestamp). Now: if the input is
+    timezone-aware, convert it via astimezone(); if naive, assume UTC
+    and attach the target zone directly on the datetime object - never
+    by string concatenation."""
 
     if not utc_string:
         return None
 
-    riyadh_tz = timezone(timedelta(hours=BOOKING_TIME_UTC_OFFSET_HOURS))
+    try:
+        target_tz = ZoneInfo(timezone_name)
+    except Exception:
+        logger.warning("to_riyadh: unknown timezone %r, falling back to %s", timezone_name, DEFAULT_TIMEZONE)
+        target_tz = ZoneInfo(DEFAULT_TIMEZONE)
+
     cleaned = utc_string.replace("Z", "+00:00")
 
     dt = None
@@ -120,17 +135,17 @@ def to_riyadh(utc_string: Optional[str]) -> Optional[str]:
         return utc_string
 
     if dt.tzinfo is not None:
-        # Already timezone-aware - convert the actual instant to Riyadh's
-        # offset (adjusts the wall-clock time correctly), don't just
-        # relabel or append to it.
-        riyadh_dt = dt.astimezone(riyadh_tz)
+        # Already timezone-aware - convert the actual instant to the
+        # target zone (adjusts the wall-clock time correctly), don't
+        # just relabel or append to it.
+        local_dt = dt.astimezone(target_tz)
     else:
-        # Naive - assume UTC, add the offset and attach it directly on
-        # the datetime object (so isoformat() renders it correctly on
-        # its own, with no manual string suffix needed).
-        riyadh_dt = (dt + timedelta(hours=BOOKING_TIME_UTC_OFFSET_HOURS)).replace(tzinfo=riyadh_tz)
+        # Naive - assume UTC, attach UTC first then convert, so DST
+        # rules (where applicable) are resolved correctly rather than
+        # applying a flat manual offset.
+        local_dt = dt.replace(tzinfo=timezone.utc).astimezone(target_tz)
 
-    return riyadh_dt.isoformat()
+    return local_dt.isoformat()
 
 
 def _display_time_12h(iso_string: Optional[str]) -> str:
@@ -173,9 +188,11 @@ _FIELD_MAP = (
 )
 
 
-def _shape_appointment(item: dict) -> dict:
+def _shape_appointment(item: dict, timezone_name: str = DEFAULT_TIMEZONE) -> dict:
     """Flatten one raw API booking item into plain data fields - no
-    sentences, just values, for the LLM to reference directly."""
+    sentences, just values, for the LLM to reference directly.
+    `timezone_name` should be this client's own IANA zone (from
+    state["templates"]["_timezone"]) - see to_riyadh()."""
 
     shaped = {}
     for name, keys in _FIELD_MAP:
@@ -184,13 +201,13 @@ def _shape_appointment(item: dict) -> dict:
                 shaped[name] = item[key]
                 break
 
-    riyadh_from = to_riyadh(item.get("bookingTimeFrom"))
-    riyadh_to = to_riyadh(item.get("bookingTimeTo"))
+    local_from = to_riyadh(item.get("bookingTimeFrom"), timezone_name)
+    local_to = to_riyadh(item.get("bookingTimeTo"), timezone_name)
 
-    shaped["bookingTimeFrom"] = riyadh_from
-    shaped["bookingTimeTo"] = riyadh_to
-    shaped["date_display"] = _display_date(riyadh_from)
-    shaped["time_display"] = _display_time_12h(riyadh_from)
+    shaped["bookingTimeFrom"] = local_from
+    shaped["bookingTimeTo"] = local_to
+    shaped["date_display"] = _display_date(local_from)
+    shaped["time_display"] = _display_time_12h(local_from)
     shaped["id"] = item.get("id")
     shaped["status"] = item.get("status")
 
@@ -401,7 +418,8 @@ def lookup_appointment(
         if not items:
             return {"status": "not_found"}
 
-    shaped = [_shape_appointment(i) for i in items]
+    timezone_name = (state.get("templates") or {}).get("_timezone", DEFAULT_TIMEZONE)
+    shaped = [_shape_appointment(i, timezone_name) for i in items]
 
     if len(shaped) == 1:
         return {"status": "found_one", "appointment": shaped[0]}
@@ -440,7 +458,8 @@ def check_booking_status(
     if not items:
         return {"status": "not_found"}
 
-    appt = _shape_appointment(items[0])
+    timezone_name = (state.get("templates") or {}).get("_timezone", DEFAULT_TIMEZONE)
+    appt = _shape_appointment(items[0], timezone_name)
 
     if appt.get("statusName") == CANCELLED_STATUS_NAME:
         return {"status": "already_cancelled", "appointment": appt}
@@ -797,11 +816,12 @@ def get_doctor_schedule(
     if not items:
         return {"status": "not_found"}
 
+    timezone_name = (state.get("templates") or {}).get("_timezone", DEFAULT_TIMEZONE)
     schedules = [
         {
             "recurringDaysNames": item.get("recurringDaysNames"),
-            "fromDateTime": to_riyadh(item.get("fromDateTime")),
-            "toDateTime": to_riyadh(item.get("toDateTime")),
+            "fromDateTime": to_riyadh(item.get("fromDateTime"), timezone_name),
+            "toDateTime": to_riyadh(item.get("toDateTime"), timezone_name),
         }
         for item in items
     ]
@@ -852,10 +872,11 @@ def get_available_reschedule_slots(
     if not items:
         return {"status": "not_found"}
 
+    timezone_name = (state.get("templates") or {}).get("_timezone", DEFAULT_TIMEZONE)
     slots = []
     for item in items:
-        slot_start = to_riyadh(item.get("slotStart"))
-        slot_end = to_riyadh(item.get("slotEnd"))
+        slot_start = to_riyadh(item.get("slotStart"), timezone_name)
+        slot_end = to_riyadh(item.get("slotEnd"), timezone_name)
         slots.append({
             "slotStart": slot_start,
             "slotEnd": slot_end,
