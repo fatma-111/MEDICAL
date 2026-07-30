@@ -857,6 +857,7 @@ def get_next_weekday_date(
 def get_doctor_schedule(
     state: Annotated[AgentState, InjectedState],
     ref_number: str,
+    target_date: str = "",
     language: str = "en",
 ) -> dict:
     """Get the GENERAL RECURRING weekly schedule of the doctor on a given
@@ -865,7 +866,14 @@ def get_doctor_schedule(
     to reschedule, to know which days of the week are even worth
     checking - this does NOT return specific open time slots (use
     `get_available_reschedule_slots` for that once you've picked a
-    target date). Returns:
+    target date).
+
+    `target_date` (format "YYYY-MM-DD"), if you already have one in mind
+    (e.g. from `get_next_weekday_date`), filters to only the schedule
+    row(s) actually valid/effective on that specific date - avoiding
+    stale/expired or not-yet-started schedule rows for the same doctor.
+    If omitted, defaults to today.
+    Returns:
     {"status": "found", "schedules": [{"recurringDaysNames": [...], "fromDateTime": ..., "toDateTime": ...}, ...]}
     {"status": "not_found"}  # booking or schedule doesn't exist
     {"status": "not_configured"}  # this clinic doesn't have this feature set up yet
@@ -881,7 +889,16 @@ def get_doctor_schedule(
         logger.warning("get_doctor_schedule called but no doctors_base_url is configured for client_id=%s", state.get("client_id"))
         return {"status": "not_configured"}
 
-    result = api.get_doctor_schedule(base_url, doctor_ids=[resolved["doctor_id"]])
+    timezone_name = (state.get("templates") or {}).get("_timezone", DEFAULT_TIMEZONE)
+    if target_date:
+        effective_date = target_date
+    else:
+        try:
+            effective_date = datetime.now(ZoneInfo(timezone_name)).date().isoformat()
+        except Exception:
+            effective_date = None
+
+    result = api.get_doctor_schedule(base_url, doctor_ids=[resolved["doctor_id"]], effective_date=effective_date)
 
     if not result["success"]:
         logger.error("get_doctor_schedule API call failed: status_code=%s error=%s", result.get("status_code"), result.get("error"))
