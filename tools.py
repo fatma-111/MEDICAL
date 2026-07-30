@@ -28,7 +28,7 @@ should decide" replaces every heuristic classifier):
 import logging
 import re
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Annotated, Dict, Optional
 
@@ -794,22 +794,33 @@ _WEEKDAY_NAMES = {
 
 
 @tool
-def get_next_weekday_date(weekday_name: str, timezone_name: str = DEFAULT_TIMEZONE) -> dict:
-    """Resolve a weekday NAME (e.g. "Thursday"/"الخميس") to the actual
-    upcoming calendar date for it, computed exactly - NEVER work out
-    which calendar date a weekday name falls on yourself, your own
-    mental date arithmetic is not reliable enough for this and has
-    caused real incorrect answers before (e.g. calling a date "Thursday"
-    that was not actually a Thursday). ALWAYS call this tool instead,
-    every time a user names a day of the week rather than a specific
-    date, before doing anything else with that day.
+def get_next_weekday_date(
+    weekday_name: str,
+    after_date: str = "",
+    timezone_name: str = DEFAULT_TIMEZONE,
+) -> dict:
+    """Resolve a weekday NAME (e.g. "Thursday"/"الخميس") to an actual
+    calendar date, computed exactly - NEVER work out which calendar date
+    a weekday name falls on yourself, your own mental date arithmetic is
+    not reliable enough for this and has caused real incorrect answers
+    before (e.g. calling a date "Thursday" that was not actually a
+    Thursday). ALWAYS call this tool instead, every time a user names a
+    day of the week rather than a specific date.
 
-    If today itself already IS that weekday, returns TODAY's date, not
-    next week's - if you need next week specifically instead, say so and
-    this can be called again the same way once today's date has passed.
+    Two modes:
+    - `after_date` OMITTED (empty): returns the NEXT upcoming date for
+      that weekday counting from TODAY. If today itself already IS that
+      weekday, returns TODAY's date.
+    - `after_date` GIVEN (format "YYYY-MM-DD", e.g. from an earlier call
+      to this same tool, or from get_available_reschedule_slots): returns
+      the next occurrence of that weekday STRICTLY AFTER that date - use
+      this whenever the user refers to a day relative to one you already
+      discussed (e.g. "the following Monday" / "الاثنين اللي بعده" after
+      you'd already established a specific Monday's date) - do NOT ask
+      them to clarify what date they mean, just call this directly.
     Returns:
     {"status": "found", "date": "YYYY-MM-DD", "weekday_name": "Thursday"}
-    {"status": "error"}  # unrecognized weekday name"""
+    {"status": "error"}  # unrecognized weekday name or bad after_date"""
 
     key = (weekday_name or "").strip().lower()
     target_weekday = _WEEKDAY_NAMES.get(key)
@@ -823,10 +834,20 @@ def get_next_weekday_date(weekday_name: str, timezone_name: str = DEFAULT_TIMEZO
     except Exception:
         tz = ZoneInfo(DEFAULT_TIMEZONE)
 
-    today = datetime.now(tz).date()
-    days_ahead = (target_weekday - today.weekday()) % 7
+    if after_date:
+        try:
+            reference = date.fromisoformat(after_date.strip())
+        except ValueError:
+            logger.warning("get_next_weekday_date: invalid after_date=%r", after_date)
+            return {"status": "error"}
+        days_ahead = (target_weekday - reference.weekday()) % 7
+        if days_ahead == 0:
+            days_ahead = 7  # strictly AFTER the reference date, never the same day
+    else:
+        reference = datetime.now(tz).date()
+        days_ahead = (target_weekday - reference.weekday()) % 7
 
-    target_date = today + timedelta(days=days_ahead)
+    target_date = reference + timedelta(days=days_ahead)
     english_name = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"][target_weekday]
 
     return {"status": "found", "date": target_date.isoformat(), "weekday_name": english_name}
