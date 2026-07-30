@@ -114,9 +114,19 @@ def _post_bookings(url: str, payload: dict, language: Optional[str], client_id: 
         return _result(False, error=str(exc))
 
     if response.status_code >= 500:
+        logger.error("GuestBookings API server error: %s status=%s body=%s", url, response.status_code, response.text[:500])
         return _result(False, response.status_code, error="server_error")
 
+    if response.status_code in (401, 403):
+        logger.error(
+            "GuestBookings API AUTHENTICATION/AUTHORIZATION error (%s) - this is a credentials/access "
+            "problem on the API server itself, not a request-content problem: %s body=%s",
+            response.status_code, url, response.text[:500],
+        )
+        return _result(False, response.status_code, error="authentication_error")
+
     if response.status_code >= 400:
+        logger.error("GuestBookings API validation error: %s status=%s body=%s", url, response.status_code, response.text[:500])
         return _result(False, response.status_code, error="validation_error")
 
     try:
@@ -432,7 +442,7 @@ def _put_json(url: str, payload: dict, client_id: Optional[str] = None) -> dict:
     """Generic PUT + envelope handling, mirroring _post_json exactly but
     for the one confirmed PUT endpoint (GuestBookings/Update)."""
 
-    logger.debug("PUT %s payload=%s", url, payload)
+    logger.info("PUT %s payload=%s", url, payload)
 
     try:
         response = requests.put(
@@ -449,15 +459,18 @@ def _put_json(url: str, payload: dict, client_id: Optional[str] = None) -> dict:
         return _result(False, error=str(exc))
 
     if response.status_code >= 500:
-        logger.error("GuestBookings/Update server error: %s status=%s body=%s", url, response.status_code, response.text[:1000])
+        logger.error("GuestBookings/Update server error: %s status=%s payload=%s body=%s", url, response.status_code, payload, response.text[:1000])
         return _result(False, response.status_code, error="server_error")
 
     if response.status_code == 404:
-        logger.error("GuestBookings/Update endpoint NOT FOUND (404): %s body=%s", url, response.text[:500])
+        logger.error("GuestBookings/Update endpoint NOT FOUND (404): %s payload=%s body=%s", url, payload, response.text[:500])
         return _result(False, response.status_code, error="endpoint_not_found")
 
     if response.status_code >= 400:
-        logger.error("GuestBookings/Update validation error: %s status=%s body=%s", url, response.status_code, response.text[:1000])
+        logger.error(
+            "GuestBookings/Update validation error: %s status=%s payload=%s body=%r headers=%s",
+            url, response.status_code, payload, response.text[:1000], dict(response.headers),
+        )
         return _result(False, response.status_code, error="validation_error")
 
     try:
