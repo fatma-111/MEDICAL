@@ -928,6 +928,24 @@ def get_available_reschedule_slots(
     if resolved["status"] != "found":
         return resolved
 
+    # Safety net: if the range came in backwards (from_date after
+    # to_date), swap them. Confirmed directly in production: the LLM
+    # passed from_date=09:00 and to_date=07:00 (inverted) - the real API
+    # appears to silently ignore date filtering entirely when given a
+    # nonsensical inverted range, returning generic/unfiltered slots
+    # instead (which is what caused already-passed times to still
+    # appear). Guaranteeing a valid, forward-ordered range here removes
+    # dependence on the LLM getting the order right.
+    try:
+        if from_date and to_date and datetime.fromisoformat(from_date) > datetime.fromisoformat(to_date):
+            logger.warning(
+                "get_available_reschedule_slots: from_date=%r was AFTER to_date=%r - swapping them",
+                from_date, to_date,
+            )
+            from_date, to_date = to_date, from_date
+    except ValueError:
+        pass  # let the API itself reject a genuinely malformed date string
+
     base_url = _doctors_base_url(state)
 
     if not base_url:
@@ -961,6 +979,23 @@ def get_available_reschedule_slots(
             "serviceName": item.get("serviceName"),
             "servicePrice": item.get("servicePrice"),
         })
+
+    # Exclude slots that have already passed - a slot for TODAY earlier
+    # than right now must never still be offered (observed directly:
+    # 9:00 AM was still shown while the conversation was happening at
+    # ~5pm the same day). Compared in the client's own local timezone,
+    # matching how slotStart itself was already converted.
+    try:
+        now_local = datetime.now(ZoneInfo(timezone_name))
+        slots = [
+            s for s in slots
+            if s["slotStart"] and datetime.fromisoformat(s["slotStart"]) > now_local
+        ]
+    except Exception:
+        logger.exception("get_available_reschedule_slots: failed to filter past slots, showing all")
+
+    if not slots:
+        return {"status": "not_found"}
 
     # Always chronological - the API's own return order was observed to
     # be scrambled in production (slots came back neither ascending nor
