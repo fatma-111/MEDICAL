@@ -391,6 +391,7 @@ def get_doctors(
 def get_doctor_schedule(
     base_url: str,
     doctor_ids: list,
+    effective_date: Optional[str] = None,
     page_size: int = 50,
     client_id: Optional[str] = None,
 ) -> dict:
@@ -400,10 +401,22 @@ def get_doctor_schedule(
     work, and their daily start/end times, and the date range this
     schedule is valid for) - NOT specific available time slots. Each
     item has recurringDaysNames/fromDateTime/toDateTime among other
-    fields (confirmed directly from the API's real response)."""
+    fields (confirmed directly from the API's real response).
+
+    `effective_date` (e.g. "2026-07-30"), when given, filters to ONLY
+    schedule rows that are actually effective/valid on that date - using
+    `fromDateTimeTo`=effective_date (the row's own validity START must be
+    on or before this date) and `toDateTimeFrom`=effective_date (the
+    row's own validity END must be on or after this date). Without this,
+    stale/expired or not-yet-started schedule rows for the doctor could
+    also be returned alongside the currently valid one."""
 
     url = f"{base_url}/api/DoctorSchedules/GetList"
     payload = {"pageNumber": 1, "pageSize": page_size, "doctorIds": doctor_ids}
+
+    if effective_date:
+        payload["fromDateTimeTo"] = effective_date
+        payload["toDateTimeFrom"] = effective_date
 
     return _post_json(url, payload, client_id=client_id)
 
