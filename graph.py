@@ -36,6 +36,7 @@ nodes; the LLM decides turn-by-turn whether it needs another tool call
 or needs to ask the user something.
 """
 
+import json
 import logging
 import re
 from typing import Optional
@@ -157,6 +158,56 @@ def _already_contains_greeting(reply_text: str, greeting: str) -> bool:
         return True
 
     return False
+
+
+def _build_slots_numbered_list_directive(messages: list) -> str:
+    """
+    If the LAST message is a ToolMessage from `get_available_reschedule_slots`
+    with status "found", pre-build the EXACT numbered list of slot times in
+    code and hand it to the model as a ready-made block to include
+    verbatim - rather than only instructing it to format the list itself,
+    which was not reliably followed even after an explicit prose
+    instruction (observed directly in production - the numbered list
+    format never appeared).
+
+    Returns an empty string when the last message isn't a matching,
+    successful slots-lookup tool result.
+    """
+
+    if not messages:
+        return ""
+
+    last = messages[-1]
+
+    if getattr(last, "name", None) != "get_available_reschedule_slots":
+        return ""
+
+    try:
+        data = json.loads(last.content)
+    except (ValueError, TypeError):
+        return ""
+
+    if data.get("status") != "found":
+        return ""
+
+    slots = data.get("slots") or []
+    if not slots:
+        return ""
+
+    lines = [f"{i + 1}. {slot.get('time_display', '')}" for i, slot in enumerate(slots)]
+    numbered_list = "\n".join(lines)
+
+    return (
+        "============================================================\n"
+        "READY-MADE NUMBERED SLOT LIST - USE THIS EXACT TEXT\n"
+        "============================================================\n"
+        "The available time slots were just looked up. Include this exact "
+        "numbered list, verbatim, in your reply (translated/introduced "
+        "naturally in your own words around it, but the list itself "
+        "unchanged), and ask the user to reply with either the number or "
+        "the exact time:\n\n"
+        f"{numbered_list}\n\n"
+    )
 
 
 def _build_greeting(templates: dict, user_message: str, target_language: str) -> str:
@@ -410,7 +461,9 @@ def agent(state: AgentState) -> dict:
         else ""
     )
 
-    system_content = language_directive + no_symptom_directive + state["system_prompt"]
+    slots_directive = _build_slots_numbered_list_directive(state["messages"])
+
+    system_content = language_directive + no_symptom_directive + slots_directive + state["system_prompt"]
 
     if not state.get("greeted"):
         system_content += (
