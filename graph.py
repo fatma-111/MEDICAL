@@ -194,7 +194,15 @@ def _build_slots_numbered_list_directive(messages: list) -> str:
     if not slots:
         return ""
 
-    lines = [f"{i + 1}. {slot.get('time_display', '')}" for i, slot in enumerate(slots)]
+    _NUMBER_EMOJIS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+
+    def _numbered_prefix(n: int) -> str:
+        # Emoji badges for 1-10 (matching the reference example's visual
+        # style); plain "N." beyond that, since there's no standard emoji
+        # digit for two-digit numbers.
+        return _NUMBER_EMOJIS[n - 1] if 1 <= n <= 10 else f"{n}."
+
+    lines = [f"{_numbered_prefix(i + 1)} {slot.get('time_display', '')}" for i, slot in enumerate(slots)]
     numbered_list = "\n".join(lines)
 
     return (
