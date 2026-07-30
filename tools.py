@@ -962,6 +962,28 @@ def get_available_reschedule_slots(
             "servicePrice": item.get("servicePrice"),
         })
 
+    # Always chronological - the API's own return order was observed to
+    # be scrambled in production (slots came back neither ascending nor
+    # descending), and relying on the LLM to re-sort dozens of items
+    # correctly by eye is not realistic. Sort here, once, in code.
+    slots.sort(key=lambda s: s["slotStart"] or "")
+
+    # Cap to a reasonable, actually-usable count for a chat interface.
+    # Observed in production: a too-wide [from_date, to_date] query
+    # returned 44 slots spanning nearly 24 hours - regardless of why
+    # that range was too wide, showing dozens of options in a chat
+    # message is not usable. This guarantees a sane result independent
+    # of whether the date-range scoping prompt guidance is followed.
+    MAX_SLOTS_TO_SHOW = 20
+    if len(slots) > MAX_SLOTS_TO_SHOW:
+        logger.warning(
+            "get_available_reschedule_slots: %d slots returned for range [%s, %s] - "
+            "capping to the first %d chronologically (this usually means the "
+            "queried date range was wider than a single day's actual working hours)",
+            len(slots), from_date, to_date, MAX_SLOTS_TO_SHOW,
+        )
+        slots = slots[:MAX_SLOTS_TO_SHOW]
+
     return {"status": "found", "slots": slots}
 
 
