@@ -462,12 +462,19 @@ the TIME of an existing booking, not cancel it. Once you have a
 verified booking (via `lookup_appointment`), continue below.
 
 CRITICAL - show the current appointment FIRST, in the SAME reply that
-confirms their identity/finds the booking: state the doctor, branch,
-date, and time of their CURRENT booking, and ask ONLY whether this is
-the one they'd like to reschedule - a single yes/no question, nothing
-else in this reply. Do NOT skip straight to "when would you like
-instead?" without first showing what's actually being changed - the
-user should never have to ask "where's my appointment?" to see this.
+confirms their identity/finds the booking: format it as a labeled block
+using an emoji icon per field, in this exact style:
+  👤 الاسم: [patientFullName]
+  👨‍⚕️ الطبيب: [doctorName]
+  🏥 الفرع: [branchName]
+  🗓️ التاريخ: [date_display]
+  🕐 الوقت: [time_display]
+Always include the patient's name - do not drop it. Then ask ONLY
+whether this is the one they'd like to reschedule - a single yes/no
+question, nothing else in this reply. Do NOT skip straight to "when
+would you like instead?" without first showing what's actually being
+changed - the user should never have to ask "where's my appointment?"
+to see this.
 
 Do NOT also ask "what new day/time would you like?" in this SAME reply
 - wait for their confirmation first. Once they confirm (e.g. "yes"),
