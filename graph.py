@@ -195,15 +195,31 @@ def _build_slots_numbered_list_directive(messages: list) -> str:
         return ""
 
     _NUMBER_EMOJIS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+    GROUP_SIZE = 10
 
-    def _numbered_prefix(n: int) -> str:
-        # Emoji badges for 1-10 (matching the reference example's visual
-        # style); plain "N." beyond that, since there's no standard emoji
-        # digit for two-digit numbers.
-        return _NUMBER_EMOJIS[n - 1] if 1 <= n <= 10 else f"{n}."
+    groups = [slots[i:i + GROUP_SIZE] for i in range(0, len(slots), GROUP_SIZE)]
 
-    lines = [f"{_numbered_prefix(i + 1)} {slot.get('time_display', '')}" for i, slot in enumerate(slots)]
-    numbered_list = "\n".join(lines)
+    group_blocks = []
+    for group_index, group_slots in enumerate(groups):
+        lines = [f"{_NUMBER_EMOJIS[i]} {slot.get('time_display', '')}" for i, slot in enumerate(group_slots)]
+        if len(groups) > 1:
+            # Each group restarts its own emoji numbering (1️⃣-🔟), so a
+            # label is required to disambiguate which group a bare number
+            # refers to when there's more than one.
+            label = f"المجموعة {group_index + 1}:" if group_index else "المجموعة الأولى:"
+            group_blocks.append(f"{label}\n" + "\n".join(lines))
+        else:
+            group_blocks.append("\n".join(lines))
+
+    numbered_list = "\n\n".join(group_blocks)
+
+    multi_group_note = (
+        "There is more than one group, and each restarts its own 1️⃣-🔟 "
+        "numbering - if the user replies with just a bare number, ask "
+        "which group they mean (or encourage them to reply with the "
+        "exact time instead, which is always unambiguous).\n\n"
+        if len(groups) > 1 else ""
+    )
 
     return (
         "============================================================\n"
@@ -212,9 +228,10 @@ def _build_slots_numbered_list_directive(messages: list) -> str:
         "The available time slots were just looked up. Include this exact "
         "numbered list, verbatim, in your reply (translated/introduced "
         "naturally in your own words around it, but the list itself "
-        "unchanged), and ask the user to reply with either the number or "
+        f"unchanged), and ask the user to reply with either the number or "
         "the exact time:\n\n"
         f"{numbered_list}\n\n"
+        f"{multi_group_note}"
     )
 
 
