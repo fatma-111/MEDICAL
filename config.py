@@ -171,10 +171,20 @@ CANCELLABLE_STATUSES = ("New", "Confirmed")
 
 
 # ==========================================================
-# Timezone conversion (f_lookup_appointment.json "toRiyadh" code nodes)
+# Timezone conversion (per-client, NOT a single hardcoded offset)
 # ==========================================================
+#
+# client_config.csv already has a real "timezone" column per client
+# (e.g. "Africa/Cairo" for Dar El Oyoun, "Asia/Riyadh" for tanasuq) -
+# this used to be ignored in favor of a single hardcoded "+3 hours"
+# applied to every clinic regardless of its actual timezone, which would
+# have silently produced wrong times for any clinic outside Saudi
+# Arabia. tools.py's to_riyadh() (kept its historical name, but now
+# genuinely per-client) reads this value from state["templates"]
+# instead. This constant is ONLY the fallback for the rare client row
+# missing the column entirely.
 
-BOOKING_TIME_UTC_OFFSET_HOURS: int = 3  # UTC -> Asia/Riyadh, matches n8n Code nodes
+DEFAULT_TIMEZONE: str = os.getenv("DEFAULT_TIMEZONE", "Asia/Riyadh")
 
 
 # ==========================================================
@@ -410,6 +420,7 @@ def get_messages(client_id: str, dialect: Optional[str] = None) -> dict:
     merged["_doctors_base_url"] = _ENV_DOCTORS_BASE_URL_OVERRIDE or client_row.get("doctors_base_url") or None
     merged["_phone_example"] = client_row.get("phone_example")
     merged["_country_codes_hint"] = client_row.get("country_codes_hint")
+    merged["_timezone"] = client_row.get("timezone") or DEFAULT_TIMEZONE
     merged["_dialect_name"] = effective_dialect
     merged["_dialect_instruction"] = dialect_row.get("dialect_instruction") or client_row.get(
         "dialect_instruction"
