@@ -778,6 +778,60 @@ def _resolve_doctor_id(state: AgentState, ref_number: str, language: Optional[st
     return {"status": "found", "doctor_id": doctor_id}
 
 
+_WEEKDAY_NAMES = {
+    # English (case-insensitive)
+    "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+    "friday": 4, "saturday": 5, "sunday": 6,
+    # Arabic
+    "الاثنين": 0, "الإثنين": 0, "اثنين": 0,
+    "الثلاثاء": 1, "ثلاثاء": 1,
+    "الأربعاء": 2, "الاربعاء": 2, "أربعاء": 2, "اربعاء": 2,
+    "الخميس": 3, "خميس": 3,
+    "الجمعة": 4, "جمعة": 4,
+    "السبت": 5, "سبت": 5,
+    "الأحد": 6, "الاحد": 6, "أحد": 6, "احد": 6,
+}
+
+
+@tool
+def get_next_weekday_date(weekday_name: str, timezone_name: str = DEFAULT_TIMEZONE) -> dict:
+    """Resolve a weekday NAME (e.g. "Thursday"/"الخميس") to the actual
+    upcoming calendar date for it, computed exactly - NEVER work out
+    which calendar date a weekday name falls on yourself, your own
+    mental date arithmetic is not reliable enough for this and has
+    caused real incorrect answers before (e.g. calling a date "Thursday"
+    that was not actually a Thursday). ALWAYS call this tool instead,
+    every time a user names a day of the week rather than a specific
+    date, before doing anything else with that day.
+
+    If today itself already IS that weekday, returns TODAY's date, not
+    next week's - if you need next week specifically instead, say so and
+    this can be called again the same way once today's date has passed.
+    Returns:
+    {"status": "found", "date": "YYYY-MM-DD", "weekday_name": "Thursday"}
+    {"status": "error"}  # unrecognized weekday name"""
+
+    key = (weekday_name or "").strip().lower()
+    target_weekday = _WEEKDAY_NAMES.get(key)
+
+    if target_weekday is None:
+        logger.warning("get_next_weekday_date: unrecognized weekday_name=%r", weekday_name)
+        return {"status": "error"}
+
+    try:
+        tz = ZoneInfo(timezone_name)
+    except Exception:
+        tz = ZoneInfo(DEFAULT_TIMEZONE)
+
+    today = datetime.now(tz).date()
+    days_ahead = (target_weekday - today.weekday()) % 7
+
+    target_date = today + timedelta(days=days_ahead)
+    english_name = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"][target_weekday]
+
+    return {"status": "found", "date": target_date.isoformat(), "weekday_name": english_name}
+
+
 @tool
 def get_doctor_schedule(
     state: Annotated[AgentState, InjectedState],
@@ -937,6 +991,7 @@ ALL_TOOLS = [
     verify_otp,
     list_specialties,
     find_available_doctors,
+    get_next_weekday_date,
     get_doctor_schedule,
     get_available_reschedule_slots,
     reschedule_appointment,
