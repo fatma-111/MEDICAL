@@ -28,7 +28,7 @@ should decide" replaces every heuristic classifier):
 import logging
 import re
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, Dict, Optional
 
 from langchain_core.tools import tool
@@ -82,27 +82,55 @@ def _is_valid_phone_format(phone: Optional[str]) -> bool:
 
 
 def to_riyadh(utc_string: Optional[str]) -> Optional[str]:
-    """UTC ISO string -> Asia/Riyadh (+3h) ISO string."""
+    """ISO string -> Asia/Riyadh (+3h) ISO string.
+
+    CRITICAL FIX: this used to blindly append the literal string "+03:00"
+    to whatever `.isoformat()` produced, regardless of whether the parsed
+    datetime already had a timezone offset attached. If the input was
+    ALREADY timezone-aware (e.g. "2026-08-06T16:00:00+00:00" - confirmed
+    directly from the real Doctors/GetDoctorScheduleSlots API response),
+    that produced a doubled, invalid offset like
+    "2026-08-06T19:00:00+00:00+03:00" - which is exactly what caused a
+    real production 400 error from GuestBookings/Update (it received an
+    unparseable timestamp). Now: if the input is timezone-aware, convert
+    it to the Riyadh offset properly via astimezone(); if it's naive
+    (no offset in the string at all), assume it's UTC and attach the
+    Riyadh offset directly on the datetime object - never by string
+    concatenation."""
 
     if not utc_string:
         return None
 
-    cleaned = utc_string.replace("Z", "")
+    riyadh_tz = timezone(timedelta(hours=BOOKING_TIME_UTC_OFFSET_HOURS))
+    cleaned = utc_string.replace("Z", "+00:00")
 
-    for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
-        try:
-            dt = datetime.strptime(cleaned, fmt)
-            break
-        except ValueError:
-            continue
+    dt = None
+
+    try:
+        dt = datetime.fromisoformat(cleaned)
+    except ValueError:
+        for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+            try:
+                dt = datetime.strptime(cleaned, fmt)
+                break
+            except ValueError:
+                continue
+
+    if dt is None:
+        return utc_string
+
+    if dt.tzinfo is not None:
+        # Already timezone-aware - convert the actual instant to Riyadh's
+        # offset (adjusts the wall-clock time correctly), don't just
+        # relabel or append to it.
+        riyadh_dt = dt.astimezone(riyadh_tz)
     else:
-        try:
-            dt = datetime.fromisoformat(cleaned)
-        except ValueError:
-            return utc_string
+        # Naive - assume UTC, add the offset and attach it directly on
+        # the datetime object (so isoformat() renders it correctly on
+        # its own, with no manual string suffix needed).
+        riyadh_dt = (dt + timedelta(hours=BOOKING_TIME_UTC_OFFSET_HOURS)).replace(tzinfo=riyadh_tz)
 
-    riyadh = dt + timedelta(hours=BOOKING_TIME_UTC_OFFSET_HOURS)
-    return riyadh.isoformat() + "+03:00"
+    return riyadh_dt.isoformat()
 
 
 def _display_time_12h(iso_string: Optional[str]) -> str:
