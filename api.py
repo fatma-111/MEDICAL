@@ -388,6 +388,28 @@ def get_doctors(
 # All three endpoints confirmed directly from the API's own Swagger
 # "Execute" output, same demo server/port as Doctors/Specialties.
 
+def get_branches(
+    base_url: str,
+    search_query: Optional[str] = None,
+    page_size: int = 200,
+    client_id: Optional[str] = None,
+) -> dict:
+    """POST {base_url}/api/Branches/GetList.
+
+    Returns this clinic's branch list - name/altName/address/city/
+    country/contact info per branch (confirmed directly from the API's
+    real response). `search_query` is optional server-side filtering;
+    the caller may also just fetch all and match client-side."""
+
+    url = f"{base_url}/api/Branches/GetList"
+    payload = {"pageNumber": 1, "pageSize": page_size}
+
+    if search_query:
+        payload["searchQuery"] = search_query
+
+    return _post_json(url, payload, client_id=client_id)
+
+
 def get_doctor_schedule(
     base_url: str,
     doctor_ids: list,
