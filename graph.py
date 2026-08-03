@@ -195,31 +195,15 @@ def _build_slots_numbered_list_directive(messages: list) -> str:
         return ""
 
     _NUMBER_EMOJIS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
-    GROUP_SIZE = 10
 
-    groups = [slots[i:i + GROUP_SIZE] for i in range(0, len(slots), GROUP_SIZE)]
+    def _numbered_prefix(n: int) -> str:
+        # Emoji badges for 1-10; plain "N." beyond that (no standard
+        # emoji digit exists for two-digit numbers) - all in one
+        # continuous flat list, no grouping/restarting.
+        return _NUMBER_EMOJIS[n - 1] if 1 <= n <= 10 else f"{n}."
 
-    group_blocks = []
-    for group_index, group_slots in enumerate(groups):
-        lines = [f"{_NUMBER_EMOJIS[i]} {slot.get('time_display', '')}" for i, slot in enumerate(group_slots)]
-        if len(groups) > 1:
-            # Each group restarts its own emoji numbering (1️⃣-🔟), so a
-            # label is required to disambiguate which group a bare number
-            # refers to when there's more than one.
-            label = f"المجموعة {group_index + 1}:" if group_index else "المجموعة الأولى:"
-            group_blocks.append(f"{label}\n" + "\n".join(lines))
-        else:
-            group_blocks.append("\n".join(lines))
-
-    numbered_list = "\n\n".join(group_blocks)
-
-    multi_group_note = (
-        "There is more than one group, and each restarts its own 1️⃣-🔟 "
-        "numbering - if the user replies with just a bare number, ask "
-        "which group they mean (or encourage them to reply with the "
-        "exact time instead, which is always unambiguous).\n\n"
-        if len(groups) > 1 else ""
-    )
+    lines = [f"{_numbered_prefix(i + 1)} {slot.get('time_display', '')}" for i, slot in enumerate(slots)]
+    numbered_list = "\n".join(lines)
 
     return (
         "============================================================\n"
@@ -231,7 +215,70 @@ def _build_slots_numbered_list_directive(messages: list) -> str:
         f"unchanged), and ask the user to reply with either the number or "
         "the exact time:\n\n"
         f"{numbered_list}\n\n"
-        f"{multi_group_note}"
+    )
+
+
+def _build_appointment_display_directive(messages: list) -> str:
+    """
+    If the LAST message is a ToolMessage from `lookup_appointment` or
+    `check_booking_status` with a single found booking, pre-build the
+    EXACT emoji-formatted appointment block in code and hand it to the
+    model as ready-made text to include verbatim - rather than only
+    instructing it to format the block itself, which was not reliably
+    followed even after multiple explicit prose instructions (confirmed
+    directly in production, more than once: the format kept reverting to
+    plain dashes instead of the requested emoji icons).
+
+    Returns an empty string when the last message isn't a matching tool
+    result with exactly one booking found.
+    """
+
+    if not messages:
+        return ""
+
+    last = messages[-1]
+    tool_name = getattr(last, "name", None)
+
+    if tool_name not in ("lookup_appointment", "check_booking_status"):
+        return ""
+
+    try:
+        data = json.loads(last.content)
+    except (ValueError, TypeError):
+        return ""
+
+    if tool_name == "lookup_appointment":
+        if data.get("status") != "found_one":
+            return ""
+        appt = data.get("appointment") or {}
+    else:
+        if data.get("status") != "active":
+            return ""
+        appt = data.get("appointment") or {}
+
+    if not appt:
+        return ""
+
+    block = (
+        f"👤 الاسم: {appt.get('patientFullName', '')}\n"
+        f"👨\u200d⚕️ الطبيب: {appt.get('doctorName', '')}\n"
+        f"🏥 الفرع: {appt.get('branchName', '')}\n"
+        f"🗓️ التاريخ: {appt.get('date_display', '')}\n"
+        f"🕐 الوقت: {appt.get('time_display', '')}"
+    )
+
+    return (
+        "============================================================\n"
+        "READY-MADE APPOINTMENT DISPLAY BLOCK - USE THIS EXACT TEXT\n"
+        "============================================================\n"
+        "A booking was just found. Include this exact block, verbatim, "
+        "in your reply (translate the LABELS only if the conversation is "
+        "in a different language - keep the emoji icons and the actual "
+        "values unchanged either way):\n\n"
+        f"{block}\n\n"
+        "After this block, ask ONLY one single yes/no question appropriate "
+        "to what's happening (e.g. confirm this is the booking to "
+        "cancel/reschedule) - nothing else in this same reply.\n\n"
     )
 
 
@@ -487,8 +534,9 @@ def agent(state: AgentState) -> dict:
     )
 
     slots_directive = _build_slots_numbered_list_directive(state["messages"])
+    appointment_display_directive = _build_appointment_display_directive(state["messages"])
 
-    system_content = language_directive + no_symptom_directive + slots_directive + state["system_prompt"]
+    system_content = language_directive + no_symptom_directive + slots_directive + appointment_display_directive + state["system_prompt"]
 
     if not state.get("greeted"):
         system_content += (
