@@ -934,6 +934,8 @@ def get_doctor_schedule(
             "recurringDaysNames": item.get("recurringDaysNames"),
             "fromDateTime": to_riyadh(item.get("fromDateTime"), timezone_name),
             "toDateTime": to_riyadh(item.get("toDateTime"), timezone_name),
+            "branchName": item.get("branchName"),
+            "doctorName": item.get("doctorName"),
         }
         for item in items
     ]
@@ -1049,6 +1051,23 @@ def get_available_reschedule_slots(
     # descending), and relying on the LLM to re-sort dozens of items
     # correctly by eye is not realistic. Sort here, once, in code.
     slots.sort(key=lambda s: s["slotStart"] or "")
+
+    # Deduplicate by exact start time - confirmed directly in production:
+    # the API returned every distinct time TWICE in a row (e.g. "11:00
+    # AM, 11:00 AM, 12:00 PM, 12:00 PM, ..."), likely once per underlying
+    # resource/service sharing the same schedule slot. The user must
+    # never see the same bookable time offered more than once.
+    seen_starts = set()
+    deduped = []
+    for s in slots:
+        key = s["slotStart"]
+        if key in seen_starts:
+            continue
+        seen_starts.add(key)
+        deduped.append(s)
+    if len(deduped) != len(slots):
+        logger.warning("get_available_reschedule_slots: removed %d duplicate slot(s) with the same start time", len(slots) - len(deduped))
+    slots = deduped
 
     # Cap to a reasonable, actually-usable count for a chat interface.
     # Observed in production: a too-wide [from_date, to_date] query
