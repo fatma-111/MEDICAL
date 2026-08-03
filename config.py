@@ -421,6 +421,7 @@ def get_messages(client_id: str, dialect: Optional[str] = None) -> dict:
     merged["_phone_example"] = client_row.get("phone_example")
     merged["_country_codes_hint"] = client_row.get("country_codes_hint")
     merged["_timezone"] = client_row.get("timezone") or DEFAULT_TIMEZONE
+    merged["_knowledge_base_file"] = client_row.get("knowledge_base_file") or ""
     merged["_dialect_name"] = effective_dialect
     merged["_dialect_instruction"] = dialect_row.get("dialect_instruction") or client_row.get(
         "dialect_instruction"
