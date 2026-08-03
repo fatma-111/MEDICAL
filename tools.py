@@ -215,8 +215,14 @@ def _shape_appointment(item: dict, timezone_name: str = DEFAULT_TIMEZONE) -> dic
 
 
 def _filter_active(items: list) -> list:
-    """Phone-path-only filter, applied when looking up bookings by phone
-    number so the user can choose which one to cancel.
+    """Excludes bookings that can no longer be cancelled or rescheduled:
+    already cancelled/completed/arrived/no-show, or past their own
+    scheduled date. Applied to BOTH the reference-number and phone-number
+    lookup paths (see lookup_appointment) - an earlier version only
+    applied this to the phone path, preserving an asymmetry from the
+    original n8n business logic; that asymmetry was explicitly removed
+    per a later request: a past/inactive booking must never be offered
+    for cancellation or rescheduling regardless of how it was found.
 
     CHANGED (explicit user request, based on a real dashboard screenshot):
     "active"/cancellable no longer requires a scheduled future visit date.
@@ -230,10 +236,6 @@ def _filter_active(items: list) -> list:
     future, which silently excluded every "New" booking without a
     visit date yet - that was the actual root cause of "no booking
     found" despite a visible, cancellable "New" row in the dashboard.
-
-    The reference-number lookup path does NOT apply this filter at all -
-    that asymmetry is unchanged, carried over from the original business
-    logic.
 
     ADDED BACK (explicit follow-up request): a booking with a scheduled
     visit date that has already passed must be excluded too, even if its
@@ -256,7 +258,7 @@ def _filter_active(items: list) -> list:
         "ملغ", "ألغي", "مكتمل", "منتهي", "وصل", "لم يحضر",
     )
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
 
     active = []
     for item in items:
@@ -275,7 +277,10 @@ def _filter_active(items: list) -> list:
         raw_from = item.get("bookingTimeFrom")
         if raw_from:
             try:
-                dt = datetime.fromisoformat(raw_from.replace("Z", ""))
+                dt = datetime.fromisoformat(raw_from.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    # Naive - assume UTC, same as this function always did.
+                    dt = dt.replace(tzinfo=timezone.utc)
                 if dt <= now:
                     continue  # has a scheduled date, and it's already passed
             except ValueError:
@@ -364,6 +369,13 @@ def lookup_appointment(
     {"status": "not_found"}
     {"status": "found_one", "appointment": {...}}
     {"status": "found_many", "appointments": [...]}
+    {"status": "found_but_inactive"}  # a booking exists under this ref/phone,
+                          # but it's already cancelled, completed, or its
+                          # own date/time has already passed - it can no
+                          # longer be cancelled or rescheduled. Tell the
+                          # user plainly why, don't just say "not found"
+                          # (which would wrongly imply they mistyped
+                          # something).
     {"status": "error"}  # the booking API call itself failed - a technical
                           # problem, NOT the same as "no booking exists"
     {"status": "no_channel_identity"}  # use_channel_identity was True but
@@ -411,12 +423,20 @@ def lookup_appointment(
     if not items:
         return {"status": "not_found"}
 
-    if phone:
-        # Phone path applies the active-only filter; ref path does not -
-        # exact same asymmetry as the original business logic.
-        items = _filter_active(items)
-        if not items:
-            return {"status": "not_found"}
+    # CHANGED (explicit request): both paths now apply the same
+    # active-only filter (excludes cancelled/completed/already-passed
+    # bookings). This used to only apply to the phone path, matching the
+    # original n8n business logic's asymmetry - that asymmetry is no
+    # longer wanted: a past/inactive booking must never be offered for
+    # cancellation or rescheduling, regardless of how it was looked up.
+    active_items = _filter_active(items)
+    if not active_items:
+        # A booking WAS found, but every match is already past/cancelled/
+        # completed - distinct from "no booking with that ref/phone at
+        # all", so the LLM can say why plainly instead of implying they
+        # may have mistyped something.
+        return {"status": "found_but_inactive"}
+    items = active_items
 
     timezone_name = (state.get("templates") or {}).get("_timezone", DEFAULT_TIMEZONE)
     shaped = [_shape_appointment(i, timezone_name) for i in items]
@@ -979,6 +999,16 @@ def get_available_reschedule_slots(
         return {"status": "error"}
 
     items = (result["data"] or {}).get("items", [])
+    if not items:
+        return {"status": "not_found"}
+
+    # Defense in depth: exclude any item explicitly marked isBooked=True,
+    # even though is_booked=False was already sent as a request filter -
+    # other endpoints in this same system have been observed to not
+    # always respect their own request filters (e.g. the inverted
+    # from_date/to_date range issue), so don't rely on the request filter
+    # alone for something this important (double-booking a doctor).
+    items = [i for i in items if i.get("isBooked") is not True]
     if not items:
         return {"status": "not_found"}
 
