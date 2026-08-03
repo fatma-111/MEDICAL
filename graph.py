@@ -39,6 +39,7 @@ or needs to ask the user something.
 import json
 import logging
 import re
+from datetime import datetime
 from typing import Optional
 
 from langchain_core.messages import AIMessage, SystemMessage
@@ -215,6 +216,129 @@ def _build_slots_numbered_list_directive(messages: list) -> str:
         f"unchanged), and ask the user to reply with either the number or "
         "the exact time:\n\n"
         f"{numbered_list}\n\n"
+    )
+
+
+_ARABIC_DAY_NAMES = {
+    "monday": "الاثنين", "tuesday": "الثلاثاء", "wednesday": "الأربعاء",
+    "thursday": "الخميس", "friday": "الجمعة", "saturday": "السبت", "sunday": "الأحد",
+}
+
+
+def _arabic_time_12h(iso_string: str) -> str:
+    """Format an ISO datetime string's TIME portion in Arabic 12-hour
+    style (صباحًا/ظهرًا/مساءً), matching the exact reference examples."""
+
+    if not iso_string:
+        return ""
+    try:
+        dt = datetime.fromisoformat(iso_string)
+    except ValueError:
+        return ""
+
+    hour, minute = dt.hour, dt.minute
+    hour12 = hour % 12 or 12
+
+    if hour == 12:
+        period = "ظهرًا"
+    elif hour < 12:
+        period = "صباحًا"
+    else:
+        period = "مساءً"
+
+    return f"{hour12}:00 {period}" if minute == 0 else f"{hour12}:{minute:02d} {period}"
+
+
+def _build_schedule_display_directive(messages: list) -> str:
+    """
+    If the LAST message is a ToolMessage from `get_doctor_schedule` with
+    status "found", pre-build the EXACT branch/day-grouped display block
+    in code, matching one of three confirmed reference formats depending
+    on how many branches/days are involved - rather than only instructing
+    the model to format it itself, which (like the appointment display
+    and numbered slots list before it) was not reliably followed.
+
+    Returns an empty string when the last message isn't a matching,
+    successful schedule-lookup tool result.
+    """
+
+    if not messages:
+        return ""
+
+    last = messages[-1]
+
+    if getattr(last, "name", None) != "get_doctor_schedule":
+        return ""
+
+    try:
+        data = json.loads(last.content)
+    except (ValueError, TypeError):
+        return ""
+
+    if data.get("status") != "found":
+        return ""
+
+    schedules = data.get("schedules") or []
+    if not schedules:
+        return ""
+
+    doctor_name = next((s.get("doctorName") for s in schedules if s.get("doctorName")), "")
+
+    # Group rows by branch, preserving first-seen order.
+    by_branch: dict = {}
+    branch_order = []
+    for s in schedules:
+        branch = s.get("branchName") or ""
+        if branch not in by_branch:
+            by_branch[branch] = []
+            branch_order.append(branch)
+        days = s.get("recurringDaysNames") or [""]
+        from_time = _arabic_time_12h(s.get("fromDateTime"))
+        to_time = _arabic_time_12h(s.get("toDateTime"))
+        for day in days:
+            arabic_day = _ARABIC_DAY_NAMES.get((day or "").strip().lower(), day)
+            by_branch[branch].append((arabic_day, from_time, to_time))
+
+    total_day_rows = sum(len(v) for v in by_branch.values())
+
+    if len(branch_order) == 1 and total_day_rows == 1:
+        # Format 1: single branch, single day
+        branch = branch_order[0]
+        day, from_time, to_time = by_branch[branch][0]
+        block = (
+            f"📍 الفرع: {branch}\n"
+            f"👩\u200d⚕️ الطبيب: {doctor_name}\n"
+            f"📅 اليوم: {day}\n"
+            f"🕙 المواعيد المتاحة: من {from_time} حتى {to_time}"
+        )
+    elif len(branch_order) == 1:
+        # Format 3: single branch, multiple days
+        branch = branch_order[0]
+        lines = [f"👩\u200d⚕️ الطبيب: {doctor_name}", f"📍 {branch}"]
+        for day, from_time, to_time in by_branch[branch]:
+            lines.append(f"📅 {day} | 🕙 {from_time} – {to_time}")
+        block = "\n".join(lines)
+    else:
+        # Format 2: multiple branches (each may have one or more days)
+        branch_blocks = []
+        for branch in branch_order:
+            branch_lines = [f"📍 {branch}"]
+            for day, from_time, to_time in by_branch[branch]:
+                branch_lines.append(f"📅 {day}\n🕙 {from_time} – {to_time}")
+            branch_blocks.append("\n".join(branch_lines))
+        block = f"👩\u200d⚕️ الطبيب: {doctor_name}\n" + "\n\n".join(branch_blocks)
+
+    return (
+        "============================================================\n"
+        "READY-MADE SCHEDULE DISPLAY BLOCK - USE THIS EXACT TEXT\n"
+        "============================================================\n"
+        "The doctor's schedule was just looked up. Include this exact "
+        "block, verbatim, in your reply (translate the LABELS only if "
+        "the conversation is in a different language - keep the emoji "
+        "icons and the actual values unchanged either way):\n\n"
+        f"{block}\n\n"
+        "After this block, ask ONLY which day they'd prefer - do NOT "
+        "also ask about time in this same reply.\n\n"
     )
 
 
@@ -535,8 +659,13 @@ def agent(state: AgentState) -> dict:
 
     slots_directive = _build_slots_numbered_list_directive(state["messages"])
     appointment_display_directive = _build_appointment_display_directive(state["messages"])
+    schedule_display_directive = _build_schedule_display_directive(state["messages"])
 
-    system_content = language_directive + no_symptom_directive + slots_directive + appointment_display_directive + state["system_prompt"]
+    system_content = (
+        language_directive + no_symptom_directive + slots_directive
+        + appointment_display_directive + schedule_display_directive
+        + state["system_prompt"]
+    )
 
     if not state.get("greeted"):
         system_content += (
