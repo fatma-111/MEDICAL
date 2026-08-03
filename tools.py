@@ -36,6 +36,7 @@ from langchain_core.tools import tool
 from langgraph.prebuilt import InjectedState
 
 import api
+import rag
 from config import (
     DEFAULT_TIMEZONE,
     CANCELLABLE_STATUS_CODES,
@@ -1125,6 +1126,232 @@ def reschedule_appointment(
     return {"status": "success"}
 
 
+# ==========================================================
+# General Hospital FAQ (RAG over a per-client knowledge base document)
+# ==========================================================
+#
+# Fully generic - reads whichever file client_config.csv's
+# knowledge_base_file column points to for THIS client_id (see rag.py).
+# Adding a new clinic's FAQ knowledge base is just adding a text file and
+# setting that column - no code changes needed.
+
+@tool
+def answer_hospital_faq(
+    state: Annotated[AgentState, InjectedState],
+    question: str,
+) -> dict:
+    """Look up this clinic's own general information (vision, mission,
+    values, goals, services offered, branch addresses/contact details,
+    policies, partners, etc.) to answer an FAQ-style question - NOT for
+    schedules, availability, or booking (those have their own tools).
+    Returns the most relevant passages found; summarize them naturally
+    in 2-3 sentences rather than reproducing them verbatim. Returns:
+    {"status": "found", "passages": ["...", ...]}
+    {"status": "not_found"}  # nothing relevant enough was found
+    {"status": "not_configured"}  # this clinic has no FAQ knowledge base set up yet"""
+
+    kb_file = (state.get("templates") or {}).get("_knowledge_base_file", "")
+
+    if not kb_file:
+        logger.warning("answer_hospital_faq called but no knowledge_base_file is configured for client_id=%s", state.get("client_id"))
+        return {"status": "not_configured"}
+
+    passages = rag.search(kb_file, question)
+
+    if not passages:
+        return {"status": "not_found"}
+
+    return {"status": "found", "passages": passages}
+
+
+# ==========================================================
+# Doctor/Branch info lookup (fuzzy name matching + listing)
+# ==========================================================
+#
+# READ-ONLY FAQ/info lookup - never touches booking/availability. Fully
+# generic: works off whatever Doctors/GetList and Branches/GetList
+# return for THIS client_id, no per-clinic hardcoding.
+
+def _normalize_arabic(text: str) -> str:
+    """Normalize Arabic text for fuzzy comparison: strip diacritics and
+    collapse common letter variants (alef forms, ta marbuta/ha, alef
+    maksura/ya) so typo/spelling variations still match."""
+
+    if not text:
+        return ""
+
+    text = str(text).strip().lower()
+    # Strip Arabic diacritics (tashkeel)
+    text = re.sub(r"[\u064B-\u0652\u0670]", "", text)
+    # Normalize alef variants -> ا
+    text = re.sub(r"[إأآٱ]", "ا", text)
+    # Normalize ta marbuta -> ه, alef maksura -> ي
+    text = text.replace("ة", "ه").replace("ى", "ي")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _fuzzy_match(user_input: str, candidates: list, name_keys: list) -> dict:
+    """Match `user_input` against `candidates` (list of raw API items),
+    checking each of `name_keys` per candidate. Returns:
+    {"result": "matched", "item": {...}}
+    {"result": "ambiguous", "items": [...]}   # 2+ close, similarly-scored matches
+    {"result": "not_matched"}"""
+
+    import difflib
+
+    normalized_input = _normalize_arabic(user_input)
+    if not normalized_input:
+        return {"result": "not_matched"}
+
+    scored = []
+    for item in candidates:
+        best_score = 0.0
+        for key in name_keys:
+            value = item.get(key)
+            if not value:
+                continue
+            normalized_value = _normalize_arabic(value)
+            if normalized_input == normalized_value:
+                best_score = max(best_score, 1.0)
+            elif normalized_input in normalized_value or normalized_value in normalized_input:
+                best_score = max(best_score, 0.9)
+            else:
+                ratio = difflib.SequenceMatcher(None, normalized_input, normalized_value).ratio()
+                best_score = max(best_score, ratio)
+        if best_score >= 0.6:
+            scored.append((item, best_score))
+
+    if not scored:
+        return {"result": "not_matched"}
+
+    scored.sort(key=lambda pair: pair[1], reverse=True)
+
+    top_score = scored[0][1]
+    close_matches = [item for item, score in scored if score >= top_score - 0.08]
+
+    if len(close_matches) == 1 or top_score >= 0.98:
+        return {"result": "matched", "item": close_matches[0]}
+
+    return {"result": "ambiguous", "items": close_matches[:5]}
+
+
+@tool
+def match_entity_info(
+    state: Annotated[AgentState, InjectedState],
+    user_input: str,
+    entity_type: str,
+) -> dict:
+    """FAQ/info lookup for doctors and branches - fuzzy name matching +
+    listing. READ-ONLY: never touches booking, schedules, or
+    availability - use the other tools for those.
+
+    DUAL MODE:
+      LIST MODE (user_input=""): returns ALL doctors or ALL branches as
+        a list for display.
+      RESOLVE MODE (user_input="user's raw text"): fuzzy-matches to ONE
+        entity and returns its details. Tolerates Arabic typos, letter
+        substitutions, and partial names - always pass the user's raw
+        text, don't pre-process it yourself.
+
+    `entity_type`: "doctor" or "branch".
+
+    Returns one of:
+    {"status": "list", "items": [...]}
+    {"status": "matched", "item": {...}}
+    {"status": "ambiguous", "candidates": [...]}  # show each candidate's
+        name and ask the user which one they meant
+    {"status": "not_matched"}
+    {"status": "not_configured"}  # no doctors_base_url set up for this client
+    {"status": "error"}
+
+    Doctor fields: formatedName, altName, degreeName, specialtyName,
+    defaultServiceName (serviceName), defaultServiceFee (servicePrice).
+    Branch fields: name, altName, address, cityName, countryName,
+    stateName, email, mobile."""
+
+    entity_type = (entity_type or "").strip().lower()
+    if entity_type not in ("doctor", "branch"):
+        return {"status": "error"}
+
+    base_url = _doctors_base_url(state)
+    if not base_url:
+        logger.warning("match_entity_info called but no doctors_base_url is configured for client_id=%s", state.get("client_id"))
+        return {"status": "not_configured"}
+
+    if entity_type == "doctor":
+        result = api.get_doctors(base_url, page_size=200)
+        name_keys = ["formatedName", "altName", "name"]
+    else:
+        result = api.get_branches(base_url, page_size=200)
+        name_keys = ["name", "altName", "formatedName", "cityName"]
+
+    if not result["success"]:
+        logger.error("match_entity_info API call failed: entity_type=%s status_code=%s error=%s", entity_type, result.get("status_code"), result.get("error"))
+        return {"status": "error"}
+
+    items = (result["data"] or {}).get("items", [])
+
+    if not user_input or not user_input.strip():
+        if entity_type == "doctor":
+            shaped = [
+                {
+                    "formatedName": i.get("formatedName") or i.get("name"),
+                    "altName": i.get("altName"),
+                    "specialtyName": i.get("specialtyName"),
+                    "degreeName": i.get("degreeName"),
+                }
+                for i in items
+            ]
+        else:
+            shaped = [
+                {
+                    "name": i.get("name") or i.get("formatedName"),
+                    "altName": i.get("altName"),
+                    "address": i.get("address"),
+                    "cityName": i.get("cityName"),
+                }
+                for i in items
+            ]
+        if not shaped:
+            return {"status": "not_matched"}
+        return {"status": "list", "items": shaped}
+
+    match_result = _fuzzy_match(user_input, items, name_keys)
+
+    if match_result["result"] == "not_matched":
+        return {"status": "not_matched"}
+
+    def _shape_doctor(i):
+        return {
+            "formatedName": i.get("formatedName") or i.get("name"),
+            "altName": i.get("altName"),
+            "degreeName": i.get("degreeName"),
+            "specialtyName": i.get("specialtyName"),
+            "serviceName": i.get("defaultServiceName") or i.get("serviceName"),
+            "servicePrice": i.get("defaultServiceFee") or i.get("servicePrice"),
+        }
+
+    def _shape_branch(i):
+        return {
+            "name": i.get("name") or i.get("formatedName"),
+            "altName": i.get("altName"),
+            "address": i.get("address"),
+            "cityName": i.get("cityName"),
+            "countryName": i.get("countryName"),
+            "stateName": i.get("stateName"),
+            "email": i.get("email"),
+            "mobile": i.get("mobile"),
+        }
+
+    shape_fn = _shape_doctor if entity_type == "doctor" else _shape_branch
+
+    if match_result["result"] == "matched":
+        return {"status": "matched", "item": shape_fn(match_result["item"])}
+
+    return {"status": "ambiguous", "candidates": [shape_fn(i) for i in match_result["items"]]}
+
+
 ALL_TOOLS = [
     validate_phone_format,
     compare_phone,
@@ -1139,4 +1366,6 @@ ALL_TOOLS = [
     get_doctor_schedule,
     get_available_reschedule_slots,
     reschedule_appointment,
+    answer_hospital_faq,
+    match_entity_info,
 ]
