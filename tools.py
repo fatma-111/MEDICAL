@@ -55,7 +55,9 @@ from config import (
     SMTP_FROM_EMAIL,
     SMTP_USE_TLS,
     SMTP_USE_SSL,
+    COMPLAINT_WEBHOOK_URL,
 )
+import requests
 from state import AgentState
 
 logger = logging.getLogger(__name__)
@@ -2391,11 +2393,13 @@ def send_complaint_email(
     category: str,
     details: str,
 ) -> dict:
-    """Send a hospital complaint by email via SMTP once ALL required
-    details have been collected AND confirmed with the user (category,
-    details, patient_name, phone, branch). Call this only ONE time per
+    """Send a hospital complaint once ALL required details have been
+    collected AND confirmed with the user (category, details,
+    patient_name, phone, branch). Call this only ONE time per
     complaint, right before telling the user their complaint was
-    submitted.
+    submitted. Delivery goes via an n8n webhook when configured
+    (preferred), or direct SMTP otherwise - this is decided
+    automatically by server configuration, not something you control.
 
     `details` must faithfully reflect exactly what the user actually
     said - never a vague generic paraphrase (e.g. never reduce a
@@ -2406,7 +2410,7 @@ def send_complaint_email(
     Returns:
     {"status": "sent"}
     {"status": "not_configured"}  # this clinic has no complaint recipient email(s) set up
-    {"status": "error"}  # the email failed to send (SMTP error)"""
+    {"status": "error"}  # sending failed (webhook or SMTP error)"""
 
     templates = state.get("templates") or {}
     to_emails_raw = templates.get("_complaint_email_to", "")
@@ -2415,10 +2419,6 @@ def send_complaint_email(
     if not to_emails:
         logger.warning("send_complaint_email called but no complaint_email_to is configured for client_id=%s", state.get("client_id"))
         return {"status": "not_configured"}
-
-    if not SMTP_HOST or not SMTP_USERNAME or not SMTP_PASSWORD:
-        logger.error("send_complaint_email: SMTP is not configured (SMTP_HOST/SMTP_USERNAME/SMTP_PASSWORD missing)")
-        return {"status": "error"}
 
     timezone_name = templates.get("_timezone", DEFAULT_TIMEZONE)
     try:
@@ -2441,6 +2441,41 @@ def send_complaint_email(
         "Action Required:\n"
         "يرجى متابعة الشكوى مع المريض واتخاذ الإجراءات اللازمة."
     )
+
+    if COMPLAINT_WEBHOOK_URL:
+        # Preferred path: hand off the actual sending to n8n (its own
+        # network path is already confirmed working for this system),
+        # rather than connecting to SMTP directly from this backend -
+        # confirmed necessary after a direct SMTP connection attempt
+        # timed out in production.
+        try:
+            response = requests.post(
+                COMPLAINT_WEBHOOK_URL,
+                json={
+                    "to": to_emails,
+                    "from": SMTP_FROM_EMAIL,
+                    "subject": subject,
+                    "body": body,
+                    "patientName": patient_name,
+                    "phone": phone,
+                    "branch": branch or "غير محدد",
+                    "category": category,
+                    "details": details,
+                    "submittedOn": submitted_on,
+                },
+                timeout=15,
+            )
+            response.raise_for_status()
+        except Exception:
+            logger.exception("send_complaint_email: failed to POST to COMPLAINT_WEBHOOK_URL")
+            return {"status": "error"}
+
+        logger.info("send_complaint_email: sent complaint via webhook for patient_name=%r category=%r to=%s", patient_name, category, to_emails)
+        return {"status": "sent"}
+
+    if not SMTP_HOST or not SMTP_USERNAME or not SMTP_PASSWORD:
+        logger.error("send_complaint_email: neither COMPLAINT_WEBHOOK_URL nor SMTP is configured")
+        return {"status": "error"}
 
     msg = MIMEText(body, "plain", "utf-8")
     msg["Subject"] = subject
