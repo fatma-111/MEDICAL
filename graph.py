@@ -882,6 +882,41 @@ _NO_SYMPTOM_YET_DIRECTIVE = (
 )
 
 
+def _is_redundant_closing_question_only(reply_text: str, greeting: str) -> bool:
+    """
+    True when `reply_text` is essentially just a repeat of the
+    greeting's own last line (its closing question, e.g. "كيف أستطيع
+    مساعدتك اليوم؟ 😊") and nothing substantially more.
+
+    WHY THIS EXISTS: confirmed real production bug - on a bare opening
+    greeting with no stated intent, the model is instructed to reply
+    with nothing and let the greeting's own closing question stand
+    alone. Instead, it sometimes writes that SAME closing question
+    itself. `_already_contains_greeting` correctly does NOT flag this
+    as "already contains the greeting" (a lone closing question doesn't
+    match the persona-line signature), so the full greeting - which
+    itself already ends with that same question - gets prepended
+    anyway, and the question appears twice, back to back.
+    """
+
+    greeting_lines = [ln.strip() for ln in greeting.replace("\r", "\n").split("\n") if ln.strip()]
+    if not greeting_lines:
+        return False
+
+    closing_line = greeting_lines[-1]
+    normalized_closing = _normalize_for_compare(closing_line)
+    normalized_reply = _normalize_for_compare(reply_text)
+
+    if not normalized_closing or not normalized_reply:
+        return False
+
+    # The reply counts as "just the closing question" if, once that
+    # question is removed, nothing meaningful (more than a few stray
+    # characters of punctuation/whitespace) is left.
+    remainder = normalized_reply.replace(normalized_closing, "", 1)
+    return len(remainder) <= 3
+
+
 def agent(state: AgentState) -> dict:
     """Calls the LLM with the cached system prompt + full chat history.
     The LLM decides whether to call a tool or reply directly.
@@ -992,7 +1027,10 @@ def agent(state: AgentState) -> dict:
         greeting = _build_greeting(state.get("templates") or {}, first_user_message, target_language or "ar")
 
         if greeting and not _already_contains_greeting(response.content or "", greeting):
-            combined = f"{greeting.strip()}\n\n{response.content}".strip() if response.content else greeting.strip()
+            reply_content = response.content or ""
+            if reply_content and _is_redundant_closing_question_only(reply_content, greeting):
+                reply_content = ""
+            combined = f"{greeting.strip()}\n\n{reply_content}".strip() if reply_content else greeting.strip()
             response = AIMessage(content=combined)
 
         updates["greeted"] = True
