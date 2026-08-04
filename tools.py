@@ -1837,6 +1837,184 @@ def create_new_booking(
     return {"status": "success", "booking_ref": booking_ref}
 
 
+@tool
+def get_doctor_schedule_for_booking(
+    state: Annotated[AgentState, InjectedState],
+    target_date: str = "",
+) -> dict:
+    """For a NEW BOOKING: get the confirmed doctor's general recurring
+    schedule (which weekdays they work, daily hours, and which branch
+    each applies to). Reads doctor_id from the booking session
+    automatically - a doctor must already be confirmed via
+    `match_entity_for_booking` first.
+
+    If a branch is ALSO already confirmed in the session, the schedule
+    is automatically narrowed to that branch only. If no branch is
+    confirmed yet, the schedule spans EVERY branch the doctor works at -
+    group your reply by branch in that case (see the booking flow's own
+    display instructions).
+
+    `target_date` (format "YYYY-MM-DD"), if given, filters to only
+    currently-effective schedule rows on that date; defaults to today.
+    Returns:
+    {"status": "found", "schedules": [{"recurringDaysNames": [...], "fromDateTime": ..., "toDateTime": ..., "branchName": ..., "doctorName": ...}, ...]}
+    {"status": "not_found"} / {"status": "missing_doctor"}
+    {"status": "not_configured"} / {"status": "error"}"""
+
+    session_id = state.get("session_id")
+    session = _get_booking_session(session_id)
+    doctor_id = session.get("doctor_id")
+
+    if not doctor_id:
+        return {"status": "missing_doctor"}
+
+    base_url = _doctors_base_url(state)
+    if not base_url:
+        logger.warning("get_doctor_schedule_for_booking called but no doctors_base_url is configured for client_id=%s", state.get("client_id"))
+        return {"status": "not_configured"}
+
+    timezone_name = (state.get("templates") or {}).get("_timezone", DEFAULT_TIMEZONE)
+    if target_date:
+        effective_date = target_date
+    else:
+        try:
+            effective_date = datetime.now(ZoneInfo(timezone_name)).date().isoformat()
+        except Exception:
+            effective_date = None
+
+    branch_id = session.get("branch_id")
+    result = api.get_doctor_schedule(
+        base_url, doctor_ids=[doctor_id],
+        branch_ids=[branch_id] if branch_id else None,
+        effective_date=effective_date,
+    )
+
+    if not result["success"]:
+        logger.error("get_doctor_schedule_for_booking API call failed: status_code=%s error=%s", result.get("status_code"), result.get("error"))
+        return {"status": "error"}
+
+    items = (result["data"] or {}).get("items", [])
+    if not items:
+        return {"status": "not_found"}
+
+    schedules = [
+        {
+            "recurringDaysNames": item.get("recurringDaysNames"),
+            "fromDateTime": to_riyadh(item.get("fromDateTime"), timezone_name),
+            "toDateTime": to_riyadh(item.get("toDateTime"), timezone_name),
+            "branchName": item.get("branchName"),
+            "branchId": item.get("branchId"),
+            "doctorName": item.get("doctorName"),
+        }
+        for item in items
+    ]
+
+    return {"status": "found", "schedules": schedules}
+
+
+@tool
+def get_available_slots_for_booking(
+    state: Annotated[AgentState, InjectedState],
+    from_date: str,
+    to_date: str,
+) -> dict:
+    """For a NEW BOOKING: get the confirmed doctor's ACTUAL open time
+    slots (not just working hours) within [from_date, to_date] - both
+    ISO format, e.g. "2026-05-01T09:00:00+03:00". Typically called with
+    the exact from_date/to_date returned by `resolve_available_day`.
+    Reads doctor_id AND branch_id from the booking session automatically
+    - both must already be confirmed. Only genuinely available (not
+    already booked) slots are returned. Returns:
+    {"status": "found", "slots": [{"slotStart": ..., "slotEnd": ..., "date_display": ..., "time_display": ..., "serviceName": ..., "servicePrice": ...}, ...]}
+    {"status": "not_found"}  # no open slots in this range
+    {"status": "missing_doctor"} / {"status": "missing_branch"}
+    {"status": "not_configured"} / {"status": "error"}"""
+
+    session_id = state.get("session_id")
+    session = _get_booking_session(session_id)
+    doctor_id = session.get("doctor_id")
+    branch_id = session.get("branch_id")
+
+    if not doctor_id:
+        return {"status": "missing_doctor"}
+    if not branch_id:
+        return {"status": "missing_branch"}
+
+    base_url = _doctors_base_url(state)
+    if not base_url:
+        logger.warning("get_available_slots_for_booking called but no doctors_base_url is configured for client_id=%s", state.get("client_id"))
+        return {"status": "not_configured"}
+
+    # Safety net: swap an inverted range - confirmed real production bug
+    # for the same underlying endpoint (see get_available_reschedule_slots).
+    try:
+        if from_date and to_date and datetime.fromisoformat(from_date) > datetime.fromisoformat(to_date):
+            logger.warning("get_available_slots_for_booking: from_date=%r was AFTER to_date=%r - swapping them", from_date, to_date)
+            from_date, to_date = to_date, from_date
+    except ValueError:
+        pass
+
+    result = api.get_doctor_schedule_slots(
+        base_url, doctor_ids=[doctor_id], branch_ids=[branch_id],
+        from_date=from_date, to_date=to_date, is_booked=False, page_size=200,
+    )
+
+    if not result["success"]:
+        logger.error("get_available_slots_for_booking API call failed: status_code=%s error=%s", result.get("status_code"), result.get("error"))
+        return {"status": "error"}
+
+    items = (result["data"] or {}).get("items", [])
+    if not items:
+        return {"status": "not_found"}
+
+    items = [i for i in items if i.get("isBooked") is not True]
+    if not items:
+        return {"status": "not_found"}
+
+    timezone_name = (state.get("templates") or {}).get("_timezone", DEFAULT_TIMEZONE)
+    slots = []
+    for item in items:
+        slot_start = to_riyadh(item.get("slotStart"), timezone_name)
+        slot_end = to_riyadh(item.get("slotEnd"), timezone_name)
+        slots.append({
+            "slotStart": slot_start,
+            "slotEnd": slot_end,
+            "date_display": _display_date(slot_start),
+            "time_display": _display_time_12h(slot_start),
+            "serviceId": item.get("serviceId"),
+            "serviceName": item.get("serviceName"),
+            "servicePrice": item.get("servicePrice"),
+        })
+
+    # Exclude past slots, dedupe, sort, cap - same safeguards as the
+    # reschedule flow's equivalent (all confirmed real production issues).
+    try:
+        now_local = datetime.now(ZoneInfo(timezone_name))
+        slots = [s for s in slots if s["slotStart"] and datetime.fromisoformat(s["slotStart"]) > now_local]
+    except Exception:
+        logger.exception("get_available_slots_for_booking: failed to filter past slots, showing all")
+
+    if not slots:
+        return {"status": "not_found"}
+
+    slots.sort(key=lambda s: s["slotStart"] or "")
+
+    seen_starts = set()
+    deduped = []
+    for s in slots:
+        if s["slotStart"] in seen_starts:
+            continue
+        seen_starts.add(s["slotStart"])
+        deduped.append(s)
+    slots = deduped
+
+    MAX_SLOTS_TO_SHOW = 20
+    if len(slots) > MAX_SLOTS_TO_SHOW:
+        slots = slots[:MAX_SLOTS_TO_SHOW]
+
+    return {"status": "found", "slots": slots}
+
+
 ALL_TOOLS = [
     validate_phone_format,
     compare_phone,
@@ -1859,4 +2037,6 @@ ALL_TOOLS = [
     get_patient_info,
     resolve_available_day,
     create_new_booking,
+    get_doctor_schedule_for_booking,
+    get_available_slots_for_booking,
 ]
