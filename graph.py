@@ -267,7 +267,7 @@ def _build_schedule_display_directive(messages: list) -> str:
 
     last = messages[-1]
 
-    if getattr(last, "name", None) != "get_doctor_schedule":
+    if getattr(last, "name", None) not in ("get_doctor_schedule", "get_doctor_schedule_for_booking"):
         return ""
 
     try:
