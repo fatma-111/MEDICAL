@@ -1458,6 +1458,33 @@ def match_entity_for_booking(
         branch_filter = [session["branch_id"]] if session.get("branch_id") else None
         result = api.get_doctors(base_url, branch_ids=branch_filter, page_size=200)
         name_keys = ["formatedName", "altName", "name"]
+    elif session.get("doctor_id"):
+        # A doctor is already confirmed - only offer branches where THIS
+        # doctor actually has a schedule, derived from their own
+        # DoctorSchedules rows (same source used to display schedules),
+        # rather than every clinic branch regardless of relevance.
+        schedule_result = api.get_doctor_schedule(base_url, doctor_ids=[session["doctor_id"]])
+        if not schedule_result["success"]:
+            logger.error("match_entity_for_booking (branch, doctor-filtered): get_doctor_schedule failed: status_code=%s error=%s", schedule_result.get("status_code"), schedule_result.get("error"))
+            return {"matched": False, "ambiguous": False, "status": "error"}
+
+        schedule_items = (schedule_result["data"] or {}).get("items", [])
+        doctor_branch_ids = {s.get("branchId") for s in schedule_items if s.get("branchId")}
+
+        if not doctor_branch_ids:
+            return {"matched": False, "ambiguous": False, "status": "not_matched"}
+
+        # Cross-reference against the full branch list so altName (Arabic
+        # name), address, etc. aren't lost - DoctorSchedules/GetList only
+        # gives branchName, not altName.
+        all_branches_result = api.get_branches(base_url, page_size=200)
+        if not all_branches_result["success"]:
+            logger.error("match_entity_for_booking (branch, doctor-filtered): get_branches failed: status_code=%s error=%s", all_branches_result.get("status_code"), all_branches_result.get("error"))
+            return {"matched": False, "ambiguous": False, "status": "error"}
+
+        all_branch_items = (all_branches_result["data"] or {}).get("items", [])
+        result = {"success": True, "data": {"items": [b for b in all_branch_items if b.get("id") in doctor_branch_ids]}, "error": None}
+        name_keys = ["name", "altName", "formatedName", "cityName"]
     else:
         result = api.get_branches(base_url, page_size=200)
         name_keys = ["name", "altName", "formatedName", "cityName"]
@@ -1506,6 +1533,7 @@ def match_entity_for_booking(
             if chosen_raw:
                 shaped = _shape(chosen_raw)
                 session[f"{entity_type}_id"] = shaped["id"]
+                session[f"{entity_type}_display_name"] = _arabic_preferred_name(shaped)
                 return {"matched": True, "needsConfirmation": False, "item": shaped}
 
     match_result = _fuzzy_match(user_input, items, name_keys)
@@ -1524,8 +1552,24 @@ def match_entity_for_booking(
 
     if not needs_confirmation:
         session[f"{entity_type}_id"] = shaped["id"]
+        session[f"{entity_type}_display_name"] = _arabic_preferred_name(shaped)
 
     return {"matched": True, "needsConfirmation": needs_confirmation, "item": shaped}
+
+
+def _arabic_preferred_name(shaped_entity: dict) -> str:
+    """Pick the Arabic-preferred display name for a doctor/branch:
+    `altName` is confirmed, across every specialty/doctor/branch endpoint
+    in this API, to be the Arabic translation of `name`/`formatedName` -
+    prefer it whenever present. Falls back to whatever name is available
+    otherwise. Confirmed real user feedback: English names (e.g. "Al
+    Manar", "Omar Almodayfer") were showing up mixed into otherwise-
+    Arabic replies, which reads as unprofessional/inconsistent."""
+
+    alt = (shaped_entity.get("altName") or "").strip()
+    if alt:
+        return alt
+    return (shaped_entity.get("formatedName") or shaped_entity.get("name") or "").strip()
 
 
 @tool
@@ -1933,14 +1977,17 @@ def get_doctor_schedule_for_booking(
     if not items:
         return {"status": "not_found"}
 
+    doctor_display_name = session.get("doctor_display_name")
+    branch_display_name = session.get("branch_display_name")
+
     schedules = [
         {
             "recurringDaysNames": item.get("recurringDaysNames"),
             "fromDateTime": to_riyadh(item.get("fromDateTime"), timezone_name),
             "toDateTime": to_riyadh(item.get("toDateTime"), timezone_name),
-            "branchName": item.get("branchName"),
+            "branchName": branch_display_name if (branch_display_name and item.get("branchId") == session.get("branch_id")) else item.get("branchName"),
             "branchId": item.get("branchId"),
-            "doctorName": item.get("doctorName"),
+            "doctorName": doctor_display_name or item.get("doctorName"),
         }
         for item in items
     ]
