@@ -27,8 +27,10 @@ should decide" replaces every heuristic classifier):
 
 import logging
 import re
+import smtplib
 import time
 from datetime import date, datetime, timedelta, timezone
+from email.mime.text import MIMEText
 from zoneinfo import ZoneInfo
 from typing import Annotated, Dict, Optional
 
@@ -46,6 +48,13 @@ from config import (
     OTP_PROVIDER,
     OTP_TTL_SECONDS,
     TEST_OTP,
+    SMTP_HOST,
+    SMTP_PORT,
+    SMTP_USERNAME,
+    SMTP_PASSWORD,
+    SMTP_FROM_EMAIL,
+    SMTP_USE_TLS,
+    SMTP_USE_SSL,
 )
 from state import AgentState
 
@@ -2364,6 +2373,95 @@ def find_best_doctor_in_specialty(
     }
 
 
+# ==========================================================
+# Complaint Agent (collect a complaint, email it via SMTP)
+# ==========================================================
+
+@tool
+def send_complaint_email(
+    state: Annotated[AgentState, InjectedState],
+    patient_name: str,
+    phone: str,
+    branch: str,
+    category: str,
+    details: str,
+) -> dict:
+    """Send a hospital complaint by email via SMTP once ALL required
+    details have been collected AND confirmed with the user (category,
+    details, patient_name, phone, branch). Call this only ONE time per
+    complaint, right before telling the user their complaint was
+    submitted.
+
+    `details` must faithfully reflect exactly what the user actually
+    said - never a vague generic paraphrase (e.g. never reduce a
+    specific complaint to something like "customer service issue").
+    Use one bullet point per distinct issue if there are several.
+    `branch` can be an empty string / "غير محدد" if not applicable.
+
+    Returns:
+    {"status": "sent"}
+    {"status": "not_configured"}  # this clinic has no complaint recipient email(s) set up
+    {"status": "error"}  # the email failed to send (SMTP error)"""
+
+    templates = state.get("templates") or {}
+    to_emails_raw = templates.get("_complaint_email_to", "")
+    to_emails = [e.strip() for e in to_emails_raw.split(",") if e.strip()]
+
+    if not to_emails:
+        logger.warning("send_complaint_email called but no complaint_email_to is configured for client_id=%s", state.get("client_id"))
+        return {"status": "not_configured"}
+
+    if not SMTP_HOST or not SMTP_USERNAME or not SMTP_PASSWORD:
+        logger.error("send_complaint_email: SMTP is not configured (SMTP_HOST/SMTP_USERNAME/SMTP_PASSWORD missing)")
+        return {"status": "error"}
+
+    timezone_name = templates.get("_timezone", DEFAULT_TIMEZONE)
+    try:
+        now_local = datetime.now(ZoneInfo(timezone_name))
+    except Exception:
+        now_local = datetime.now(timezone.utc)
+    submitted_on = now_local.strftime("%d %B %Y  %I:%M %p")
+
+    subject = f"شكوى جديدة - {category} - {patient_name}"
+    body = (
+        "Complaint Details\n"
+        f"- Patient Name: {patient_name}\n"
+        f"- Mobile Number: {phone}\n"
+        f"- Branch: {branch or 'غير محدد'}\n"
+        f"- Complaint Type: {category}\n\n"
+        "Complaint Details:\n"
+        f"{details}\n\n"
+        "Submitted On:\n"
+        f"{submitted_on}\n\n"
+        "Action Required:\n"
+        "يرجى متابعة الشكوى مع المريض واتخاذ الإجراءات اللازمة."
+    )
+
+    msg = MIMEText(body, "plain", "utf-8")
+    msg["Subject"] = subject
+    msg["From"] = SMTP_FROM_EMAIL
+    msg["To"] = ", ".join(to_emails)
+
+    try:
+        if SMTP_USE_SSL:
+            server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=15)
+        else:
+            server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15)
+        try:
+            if SMTP_USE_TLS:
+                server.starttls()
+            server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            server.sendmail(SMTP_FROM_EMAIL, to_emails, msg.as_string())
+        finally:
+            server.quit()
+    except Exception:
+        logger.exception("send_complaint_email: failed to send email via SMTP")
+        return {"status": "error"}
+
+    logger.info("send_complaint_email: sent complaint email for patient_name=%r category=%r to=%s", patient_name, category, to_emails)
+    return {"status": "sent"}
+
+
 ALL_TOOLS = [
     validate_phone_format,
     compare_phone,
@@ -2389,4 +2487,5 @@ ALL_TOOLS = [
     get_doctor_schedule_for_booking,
     get_available_slots_for_booking,
     find_best_doctor_in_specialty,
+    send_complaint_email,
 ]
