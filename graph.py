@@ -220,17 +220,20 @@ def _build_slots_numbered_list_directive(messages: list) -> str:
     header = (" ".join(header_parts) + ":") if header_parts else ""
 
     return (
-        "============================================================\n"
-        "READY-MADE NUMBERED SLOT LIST - USE THIS EXACT TEXT\n"
-        "============================================================\n"
+        "[INTERNAL INSTRUCTION - NOT FOR THE USER - READ CAREFULLY]\n"
         "The available time slots were just looked up. Your ENTIRE reply "
-        "must have EXACTLY this structure: the header line below (if "
-        "present), then the numbered list, then ONE question asking them "
-        "to reply with the number or the exact time. Nothing else - do "
-        "NOT also describe the slots in your own words anywhere in the "
-        "reply.\n\n"
+        "must have EXACTLY this structure: the exact text between the "
+        "START/END markers below (header line if present, then the "
+        "numbered list), then ONE question asking them to reply with "
+        "the number or the exact time. The START/END marker lines "
+        "themselves are NOT part of the text to copy - never include "
+        "them, or any other line of dashes/equals-signs, in your actual "
+        "reply. Nothing else - do NOT also describe the slots in your "
+        "own words anywhere in the reply.\n\n"
+        "[BEGIN-EXACT-TEXT]\n"
         f"{header}\n"
-        f"{numbered_list}\n\n"
+        f"{numbered_list}\n"
+        "[END-EXACT-TEXT]\n\n"
     )
 
 
@@ -344,16 +347,18 @@ def _build_schedule_display_directive(messages: list) -> str:
         block = f"👩\u200d⚕️ الطبيب: {doctor_name}\n" + "\n\n".join(branch_blocks)
 
     return (
-        "============================================================\n"
-        "READY-MADE SCHEDULE DISPLAY BLOCK - USE THIS EXACT TEXT\n"
-        "============================================================\n"
+        "[INTERNAL INSTRUCTION - NOT FOR THE USER - READ CAREFULLY]\n"
         "The doctor's schedule was just looked up. Your ENTIRE reply "
         "must have EXACTLY this structure and nothing more:\n"
         "  1. At most one very short lead-in sentence (e.g. \"Here's the "
         "doctor's schedule:\") - or none at all.\n"
-        "  2. The block below, verbatim, unchanged (translate the LABELS "
-        "only if the conversation is in a different language - keep the "
-        "emoji icons and the actual values unchanged either way).\n"
+        "  2. The exact text between the START/END markers below, copied "
+        "verbatim, unchanged (translate the LABELS only if the "
+        "conversation is in a different language - keep the emoji icons "
+        "and the actual values unchanged either way). The START/END "
+        "marker lines themselves are NOT part of the text to copy - "
+        "never include them, or any other line of dashes/equals-signs, "
+        "in your actual reply to the user.\n"
         "  3. Exactly one question asking which day they'd prefer.\n"
         "Nothing else, anywhere in the reply. Do NOT also describe, "
         "list, or summarize any day/time/branch from the schedule in "
@@ -362,7 +367,9 @@ def _build_schedule_display_directive(messages: list) -> str:
         "production: writing your own version of the schedule ANYWHERE "
         "in the same reply as this block sends the same information "
         "twice.\n\n"
-        f"{block}\n\n"
+        "[BEGIN-EXACT-TEXT]\n"
+        f"{block}\n"
+        "[END-EXACT-TEXT]\n\n"
     )
 
 
@@ -466,14 +473,17 @@ def _build_appointment_display_directive(messages: list) -> str:
     )
 
     return (
-        "============================================================\n"
-        "READY-MADE APPOINTMENT DISPLAY BLOCK - USE THIS EXACT TEXT\n"
-        "============================================================\n"
-        "A booking was just found. Include this exact block, verbatim, "
-        "in your reply (translate the LABELS only if the conversation is "
-        "in a different language - keep the emoji icons and the actual "
-        "values unchanged either way):\n\n"
-        f"{block}\n\n"
+        "[INTERNAL INSTRUCTION - NOT FOR THE USER - READ CAREFULLY]\n"
+        "A booking was just found. Include the exact text between the "
+        "START/END markers below, verbatim, in your reply (translate "
+        "the LABELS only if the conversation is in a different language "
+        "- keep the emoji icons and the actual values unchanged either "
+        "way). The START/END marker lines themselves are NOT part of "
+        "the text to copy - never include them, or any other line of "
+        "dashes/equals-signs, in your actual reply to the user.\n\n"
+        "[BEGIN-EXACT-TEXT]\n"
+        f"{block}\n"
+        "[END-EXACT-TEXT]\n\n"
         "After this block, ask ONLY one single yes/no question appropriate "
         "to what's happening (e.g. confirm this is the booking to "
         "cancel/reschedule) - nothing else in this same reply.\n\n"
