@@ -213,6 +213,29 @@ AUTHENTICA_API_KEY: str = os.getenv("AUTHENTICA_API_KEY", "")
 AUTHENTICA_TEMPLATE_ID: str = os.getenv("AUTHENTICA_TEMPLATE_ID", "31")
 AUTHENTICA_FALLBACK_EMAIL: str = os.getenv("AUTHENTICA_FALLBACK_EMAIL", "")
 
+# SMTP config for the Complaint Agent's send_complaint_email tool.
+# Per-clinic recipient list comes from client_config.csv's own
+# "complaint_email_to" column (see get_messages) - the SMTP server
+# credentials themselves are shared infra, not per-client.
+SMTP_HOST: str = os.getenv("SMTP_HOST", "")
+SMTP_PORT: int = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USERNAME: str = os.getenv("SMTP_USERNAME", "")
+SMTP_PASSWORD: str = os.getenv("SMTP_PASSWORD", "")
+SMTP_FROM_EMAIL: str = os.getenv("SMTP_FROM_EMAIL", "") or SMTP_USERNAME
+
+# Port 465 is implicit SSL (smtplib.SMTP_SSL from the first connection) -
+# fundamentally different from port 587's STARTTLS (a plain connection
+# upgraded to TLS after connecting). Auto-detect from the port unless
+# explicitly overridden via SMTP_USE_SSL, since getting this wrong fails
+# the connection entirely rather than just being insecure.
+_smtp_use_ssl_override = os.getenv("SMTP_USE_SSL")
+if _smtp_use_ssl_override is not None:
+    SMTP_USE_SSL: bool = _smtp_use_ssl_override.strip().lower() not in ("false", "0", "")
+else:
+    SMTP_USE_SSL = SMTP_PORT == 465
+
+SMTP_USE_TLS: bool = os.getenv("SMTP_USE_TLS", "true").strip().lower() not in ("false", "0", "") and not SMTP_USE_SSL
+
 
 # ==========================================================
 # Default Country / Phone Normalization
@@ -422,6 +445,7 @@ def get_messages(client_id: str, dialect: Optional[str] = None) -> dict:
     merged["_country_codes_hint"] = client_row.get("country_codes_hint")
     merged["_timezone"] = client_row.get("timezone") or DEFAULT_TIMEZONE
     merged["_knowledge_base_file"] = client_row.get("knowledge_base_file") or ""
+    merged["_complaint_email_to"] = client_row.get("complaint_email_to") or ""
     merged["_dialect_name"] = effective_dialect
     merged["_dialect_instruction"] = dialect_row.get("dialect_instruction") or client_row.get(
         "dialect_instruction"
