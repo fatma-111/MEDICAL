@@ -2062,21 +2062,28 @@ def get_available_slots_for_booking(
 @tool
 def find_best_doctor_in_specialty(
     state: Annotated[AgentState, InjectedState],
-    specialty_id: str,
+    specialty_ids: list,
     criteria: str = "soonest",
 ) -> dict:
-    """Among ALL doctors in a given specialty, find either the one with
-    the SOONEST available appointment, or the one with the CHEAPEST
-    fee - use this when the user says they don't care which specific
-    doctor they see and just want the earliest opening, or explicitly
-    ask for the cheapest option (e.g. after seeing a list of doctors
-    for a specialty and asking "who's soonest?" or "who's cheapest?").
-    `specialty_id` must come from `list_specialties`'s own response -
-    never invented. `criteria`: "soonest" (default) or "cheapest".
+    """Among ALL doctors across one or more specialties, find either the
+    one with the SOONEST available appointment, or the one with the
+    CHEAPEST fee - use this when the user says they don't care which
+    specific doctor they see and just want the earliest opening, or
+    explicitly ask for the cheapest option (e.g. after seeing a list of
+    doctors for a specialty and asking "who's soonest?" or "who's
+    cheapest?").
+
+    `specialty_ids` must come from `list_specialties`'s own response -
+    IMPORTANT: pass ALL plausibly-matching specialty ids together as a
+    list, same as `find_available_doctors` - a general specialty and
+    its more specific sub-specialty (e.g. "Ophthalmology" AND
+    "Vitreoretinal Surgery") can both be relevant to the same complaint,
+    and passing only one risks missing doctors who are only filed under
+    the other. `criteria`: "soonest" (default) or "cheapest".
     Returns:
     {"status": "found", "doctor": {...}, "slot": {...}}  # for "soonest" - present the doctor and when
     {"status": "found", "doctor": {...}, "price": ..., "service": ...}  # for "cheapest"
-    {"status": "not_found"}  # no doctors in this specialty currently qualify
+    {"status": "not_found"}  # no doctors in these specialties currently qualify
     {"status": "not_configured"} / {"status": "error"}"""
 
     criteria = (criteria or "soonest").strip().lower()
@@ -2088,13 +2095,19 @@ def find_best_doctor_in_specialty(
         logger.warning("find_best_doctor_in_specialty called but no doctors_base_url is configured for client_id=%s", state.get("client_id"))
         return {"status": "not_configured"}
 
-    doctors_result = api.get_doctors(base_url, specialty_ids=[specialty_id], page_size=200)
+    doctors_result = api.get_doctors(base_url, specialty_ids=specialty_ids, page_size=200)
     if not doctors_result["success"]:
         logger.error("find_best_doctor_in_specialty: get_doctors failed: status_code=%s error=%s", doctors_result.get("status_code"), doctors_result.get("error"))
         return {"status": "error"}
 
-    doctors = [d for d in (doctors_result["data"] or {}).get("items", []) if d.get("hasSlots") is not False]
+    raw_doctors = (doctors_result["data"] or {}).get("items", [])
+    doctors = [d for d in raw_doctors if d.get("hasSlots") is not False]
+    logger.info(
+        "find_best_doctor_in_specialty: specialty_ids=%s criteria=%s api_returned=%d after_hasSlots_filter=%d",
+        specialty_ids, criteria, len(raw_doctors), len(doctors),
+    )
     if not doctors:
+        logger.info("find_best_doctor_in_specialty: not_found - no doctors matched specialty_ids=%s (or all filtered out by hasSlots=False)", specialty_ids)
         return {"status": "not_found"}
 
     doctor_ids = [d.get("id") for d in doctors if d.get("id")]
@@ -2119,8 +2132,14 @@ def find_best_doctor_in_specialty(
             logger.error("find_best_doctor_in_specialty: get_doctor_schedule_slots failed: status_code=%s error=%s", slots_result.get("status_code"), slots_result.get("error"))
             return {"status": "error"}
 
+        raw_slot_items = (slots_result["data"] or {}).get("items", [])
+        logger.info(
+            "find_best_doctor_in_specialty (soonest): doctor_ids=%s from=%s to=%s api_returned=%d",
+            doctor_ids, now.isoformat(), horizon.isoformat(), len(raw_slot_items),
+        )
+
         best = None
-        for item in (slots_result["data"] or {}).get("items", []):
+        for item in raw_slot_items:
             if item.get("isBooked"):
                 continue
             slot_start = to_riyadh(item.get("slotStart"), timezone_name)
@@ -2136,6 +2155,7 @@ def find_best_doctor_in_specialty(
                 best = (dt, item)
 
         if not best:
+            logger.info("find_best_doctor_in_specialty (soonest): not_found - none of %d raw item(s) qualified after filtering", len(raw_slot_items))
             return {"status": "not_found"}
 
         dt, item = best
