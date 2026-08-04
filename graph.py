@@ -732,9 +732,21 @@ def agent(state: AgentState) -> dict:
     )
 
     slots_directive = _build_slots_numbered_list_directive(state["messages"])
-    appointment_display_directive = _build_appointment_display_directive(state["messages"])
-    schedule_display_directive = _build_schedule_display_directive(state["messages"])
     wrong_tool_directive = _build_wrong_tool_in_booking_flow_directive(state["messages"], state.get("session_id"))
+
+    # CRITICAL: these two directives both trigger on the SAME
+    # lookup_appointment/check_booking_status tool result, and they say
+    # opposite things - one pre-builds the appointment block "to include
+    # verbatim", the other says "do NOT present these results". Confirmed
+    # real production failure: with both present, the display directive
+    # (earlier in the concatenation) won and the unrelated patient's
+    # booking was shown anyway. When the wrong-tool directive fires, the
+    # display directive must be suppressed entirely.
+    appointment_display_directive = (
+        "" if wrong_tool_directive
+        else _build_appointment_display_directive(state["messages"])
+    )
+    schedule_display_directive = _build_schedule_display_directive(state["messages"])
 
     system_content = (
         language_directive + no_symptom_directive + slots_directive
