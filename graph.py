@@ -267,6 +267,60 @@ def _arabic_time_12h(iso_string: str) -> str:
     return f"{hour12}:00 {period}" if minute == 0 else f"{hour12}:{minute:02d} {period}"
 
 
+def _build_day_confirmation_requires_tool_directive(messages: list) -> str:
+    """
+    If the most recent ToolMessage in the conversation (scanning
+    backwards) was `get_doctor_schedule_for_booking`, and the CURRENT
+    last message is a fresh human message (i.e. the user is now
+    replying to that schedule, e.g. naming a day) with no more recent
+    `resolve_available_day` / `get_available_slots_for_booking` call
+    since - inject a hard reminder that answering this turn requires
+    calling `resolve_available_day` first.
+
+    WHY THIS EXISTS: confirmed real production failure, even after the
+    prose instruction was already explicit - the model concluded "no
+    appointments available" for a day purely from the recurring
+    schedule's stated hours, with ZERO tool calls made that turn (no
+    trace of resolve_available_day or get_available_slots_for_booking
+    in the logs at all). The recurring schedule can only say which
+    weekdays a doctor generally works, never whether a specific upcoming
+    date actually has an open slot.
+    """
+
+    if not messages:
+        return ""
+
+    from langchain_core.messages import HumanMessage as _HumanMessage
+
+    if not isinstance(messages[-1], _HumanMessage):
+        return ""
+
+    for msg in reversed(messages[:-1]):
+        name = getattr(msg, "name", None)
+        if name in ("resolve_available_day", "get_available_slots_for_booking", "create_new_booking"):
+            return ""
+        if name == "get_doctor_schedule_for_booking":
+            return (
+                "[INTERNAL INSTRUCTION - NOT FOR THE USER - READ CAREFULLY]\n"
+                "The user is replying after seeing the doctor's recurring "
+                "schedule - likely naming a day. You are NOT allowed to "
+                "answer whether that day has an available slot from the "
+                "schedule alone, and you are NOT allowed to say "
+                "\"not available\" without checking first. Before saying "
+                "anything about availability for a specific day, you MUST "
+                "call `resolve_available_day` with that weekday. Confirmed "
+                "real failure: answering from the recurring schedule alone, "
+                "with zero tool calls, produced a false \"not available\" "
+                "for a day that actually had real, bookable slots.\n\n"
+            )
+        if name is not None:
+            # A different, unrelated tool fired more recently - this
+            # schedule display is no longer the most relevant context.
+            return ""
+
+    return ""
+
+
 def _build_schedule_display_directive(messages: list) -> str:
     """
     If the LAST message is a ToolMessage from `get_doctor_schedule` with
@@ -757,11 +811,12 @@ def agent(state: AgentState) -> dict:
         else _build_appointment_display_directive(state["messages"])
     )
     schedule_display_directive = _build_schedule_display_directive(state["messages"])
+    day_confirmation_directive = _build_day_confirmation_requires_tool_directive(state["messages"])
 
     system_content = (
         language_directive + no_symptom_directive + slots_directive
         + appointment_display_directive + schedule_display_directive
-        + wrong_tool_directive + state["system_prompt"]
+        + wrong_tool_directive + day_confirmation_directive + state["system_prompt"]
     )
 
     if not state.get("greeted"):
