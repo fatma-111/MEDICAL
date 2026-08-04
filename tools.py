@@ -1724,8 +1724,6 @@ def resolve_available_day(
 
     if not doctor_id:
         return {"status": "missing_doctor"}
-    if not branch_id:
-        return {"status": "missing_branch"}
 
     key = (weekday_name or "").strip().lower()
     target_weekday = _WEEKDAY_NAMES.get(key)
@@ -1737,6 +1735,44 @@ def resolve_available_day(
     if not base_url:
         logger.warning("resolve_available_day called but no doctors_base_url is configured for client_id=%s", state.get("client_id"))
         return {"status": "not_configured"}
+
+    if not branch_id:
+        # Try to auto-disambiguate: if this doctor's schedule shows the
+        # requested weekday at only ONE of their branches, confirm that
+        # branch automatically rather than asking - confirmed real
+        # production frustration where the model kept asking "which
+        # branch?" despite the schedule it had ALREADY shown uniquely
+        # determining the answer from the day the user just named.
+        schedule_result = api.get_doctor_schedule(base_url, doctor_ids=[doctor_id])
+        if schedule_result["success"]:
+            english_weekday_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+            target_name_en = english_weekday_names[target_weekday]
+            matching_branch_ids = set()
+            for item in (schedule_result["data"] or {}).get("items", []):
+                raw_days = item.get("recurringDaysNames") or []
+                if isinstance(raw_days, str):
+                    raw_days = [raw_days]
+                for raw_day in raw_days:
+                    day_token = str(raw_day).split(":")[-1].strip()
+                    if day_token.lower() == target_name_en.lower() and item.get("branchId"):
+                        matching_branch_ids.add(item.get("branchId"))
+            if len(matching_branch_ids) == 1:
+                branch_id = next(iter(matching_branch_ids))
+                session["branch_id"] = branch_id
+                logger.info("resolve_available_day: auto-resolved branch_id=%s from weekday=%s (unique match in doctor's schedule)", branch_id, weekday_name)
+                try:
+                    branches_result = api.get_branches(base_url, page_size=200)
+                    if branches_result["success"]:
+                        match = next((b for b in (branches_result["data"] or {}).get("items", []) if b.get("id") == branch_id), None)
+                        if match:
+                            session["branch_display_name"] = _arabic_preferred_name(match)
+                except Exception:
+                    logger.exception("resolve_available_day: failed to enrich auto-resolved branch name")
+        else:
+            logger.error("resolve_available_day: schedule lookup for branch auto-disambiguation failed: status_code=%s error=%s", schedule_result.get("status_code"), schedule_result.get("error"))
+
+    if not branch_id:
+        return {"status": "missing_branch"}
 
     timezone_name = (state.get("templates") or {}).get("_timezone", DEFAULT_TIMEZONE)
     try:
