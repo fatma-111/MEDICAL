@@ -346,6 +346,7 @@ def get_specialties(base_url: str, page_size: int = 200, client_id: Optional[str
 def get_doctors(
     base_url: str,
     specialty_ids: Optional[list] = None,
+    branch_ids: Optional[list] = None,
     has_published_service: bool = True,
     has_service_schedule: bool = True,
     intersection_start: Optional[str] = None,
@@ -360,7 +361,11 @@ def get_doctors(
     the API's own request schema) - they narrow results to doctors who
     are actually bookable with an available schedule intersecting the
     given time window. The response itself then includes `hasSlots` per
-    doctor reflecting that same filter."""
+    doctor reflecting that same filter.
+
+    `branch_ids` filters to doctors who work at any of the given
+    branches - confirmed as a real request field, used by the New
+    Booking flow's branch-first selection path."""
 
     url = f"{base_url}/api/Doctors/GetList"
     payload = {
@@ -373,6 +378,8 @@ def get_doctors(
 
     if specialty_ids:
         payload["specialtyIds"] = specialty_ids
+    if branch_ids:
+        payload["branchIds"] = branch_ids
     if intersection_start:
         payload["intersectionStart"] = intersection_start
     if intersection_end:
@@ -449,6 +456,7 @@ def get_doctor_schedule_slots(
     from_date: str,
     to_date: str,
     is_booked: bool = False,
+    branch_ids: Optional[list] = None,
     page_size: int = 200,
     client_id: Optional[str] = None,
 ) -> dict:
@@ -457,8 +465,11 @@ def get_doctor_schedule_slots(
     Returns SPECIFIC time slots within [from_date, to_date] - the actual
     bookable times, not just working days. `is_booked=False` (default)
     filters to only slots that are NOT already taken - i.e. genuinely
-    available ones. Each item has slotStart/slotEnd/isBooked among other
-    fields (confirmed directly from the API's real response)."""
+    available ones. `branch_ids` additionally narrows to a specific
+    branch (confirmed real request field) - needed for the New Booking
+    flow once both a doctor AND branch are confirmed. Each item has
+    slotStart/slotEnd/isBooked among other fields (confirmed directly
+    from the API's real response)."""
 
     url = f"{base_url}/api/Doctors/GetDoctorScheduleSlots"
     payload = {
@@ -468,6 +479,57 @@ def get_doctor_schedule_slots(
         "toDate": to_date,
         "isBooked": is_booked,
         "doctorIds": doctor_ids,
+    }
+
+    if branch_ids:
+        payload["branchIds"] = branch_ids
+
+    return _post_json(url, payload, client_id=client_id)
+
+
+def get_doctor_fees(
+    base_url: str,
+    doctor_ids: list,
+    is_published: bool = True,
+    page_size: int = 1000,
+    client_id: Optional[str] = None,
+) -> dict:
+    """POST {base_url}/api/DoctorServices/GetList.
+
+    Returns a doctor's published services and prices - confirmed
+    directly from a real production n8n workflow's request/response
+    handling (extracts serviceName/price per item)."""
+
+    url = f"{base_url}/api/DoctorServices/GetList"
+    payload = {
+        "pageNumber": 1,
+        "pageSize": page_size,
+        "isPublished": is_published,
+        "doctorIds": doctor_ids,
+    }
+
+    return _post_json(url, payload, client_id=client_id)
+
+
+def get_patient_info(
+    base_url: str,
+    mobile_number: str,
+    page_size: int = 1000,
+    client_id: Optional[str] = None,
+) -> dict:
+    """POST {base_url}/api/GuestPatients/GetList.
+
+    Looks up whether a patient is already registered by phone number -
+    confirmed directly from a real production n8n workflow. Returns
+    items with patientFullName/mobileNumber/email when found; an empty
+    result (totalCount=0) means this phone number is not registered
+    yet, so the caller should collect name/email fresh."""
+
+    url = f"{base_url}/api/GuestPatients/GetList"
+    payload = {
+        "pageNumber": 1,
+        "pageSize": page_size,
+        "mobileNumber": mobile_number,
     }
 
     return _post_json(url, payload, client_id=client_id)
@@ -544,3 +606,64 @@ def reschedule_booking(
     }
 
     return _put_json(url, payload, client_id=client_id)
+
+
+def create_booking(
+    base_url: str,
+    patient_full_name: str,
+    mobile_number: str,
+    branch_id: str,
+    doctor_id: str,
+    service_id: str,
+    service_price,
+    booking_time_from: str,
+    booking_time_to: str,
+    specialty_id: str,
+    doctor_schedule_id: str,
+    space_id: str,
+    email: str = "",
+    client_id: Optional[str] = None,
+) -> dict:
+    """POST {base_url}/api/GuestBookings/Reservation.
+
+    Creates a brand new booking - confirmed directly from a real
+    production n8n workflow's exact field list. ALL the id fields
+    (branchId, doctorId, serviceId, servicePrice, specialtyId,
+    doctorScheduleId, spaceId) must come from a slot the caller just
+    re-verified is still available (via get_doctor_schedule_slots) -
+    never invented or reused from an earlier, potentially-stale lookup.
+    Returns the raw API response - `data` is the new booking's own GUID
+    id (pass this to get_booking_by_id to retrieve its bookingRefNum)."""
+
+    url = f"{base_url}/api/GuestBookings/Reservation"
+    payload = {
+        "patientFullName": patient_full_name,
+        "mobileNumber": mobile_number,
+        "email": email,
+        "branchId": branch_id,
+        "doctorId": doctor_id,
+        "serviceId": service_id,
+        "servicePrice": service_price,
+        "bookingTimeFrom": booking_time_from,
+        "bookingTimeTo": booking_time_to,
+        "specialtyId": specialty_id,
+        "doctorScheduleId": doctor_schedule_id,
+        "spaceId": space_id,
+    }
+
+    return _post_json(url, payload, client_id=client_id)
+
+
+def get_booking_by_id(base_url: str, booking_id: str, client_id: Optional[str] = None) -> dict:
+    """POST {base_url}/api/GuestBookings/Get.
+
+    Fetches a single booking's full details by its own GUID id (as
+    opposed to get_bookings_by_ref, which looks up by the human-readable
+    bookingRefNum/phone) - confirmed directly from the production n8n
+    reference. Used right after create_booking succeeds, to read back
+    the new booking's bookingRefNum to show the user."""
+
+    url = f"{base_url}/api/GuestBookings/Get"
+    payload = {"id": booking_id}
+
+    return _post_json(url, payload, client_id=client_id)
