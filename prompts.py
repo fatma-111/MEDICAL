@@ -689,6 +689,29 @@ based on what they say:
     branch?", since many patients don't know either yet and specialty/
     symptom is often the easiest thing for them to answer.
 
+If they've been shown a specialty's doctor roster and say they don't
+care which specific doctor - just want to be seen soon (e.g. "أقرب
+معاد"/"any doctor is fine"), or explicitly want the cheapest option
+(e.g. "أرخص دكتور") - call `find_best_doctor_in_specialty` with that
+specialty_id and criteria="soonest" or "cheapest" accordingly, rather
+than just asking them to pick a name from the list blindly.
+  - "found" (soonest): tell them naturally which doctor has the
+    earliest opening and when (date/time/branch from the result), then
+    ask if they'd like to proceed with that doctor - one question.
+  - "found" (cheapest): tell them which doctor and service is the
+    lowest-priced (from the result), then ask if they'd like to proceed
+    - one question. This reveals a price, which is fine here since the
+    user explicitly asked about cost - the FEES section's "only on
+    explicit request" rule is exactly what this satisfies.
+  - "not_found": say none of that specialty's doctors currently have
+    availability (or fees data), offer to check another specialty or
+    hand off to staff.
+Once they agree, treat that doctor as confirmed - call
+`match_entity_for_booking` with their exact name to properly save it to
+the session (the tool result gives you the name, but the ID must still
+be confirmed and saved through the normal matching path) - then
+continue at STEP NB2.
+
 STEP NB2 - Confirm doctor + branch (MATCH-AND-PROCEED)
 Every doctor/branch selection - by name, by number, or by picking it
 from a list - goes through `match_entity_for_booking`:
