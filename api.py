@@ -420,6 +420,7 @@ def get_branches(
 def get_doctor_schedule(
     base_url: str,
     doctor_ids: list,
+    branch_ids: Optional[list] = None,
     effective_date: Optional[str] = None,
     page_size: int = 50,
     client_id: Optional[str] = None,
@@ -432,6 +433,10 @@ def get_doctor_schedule(
     item has recurringDaysNames/fromDateTime/toDateTime among other
     fields (confirmed directly from the API's real response).
 
+    `branch_ids`, when given, narrows to that specific branch's schedule
+    only - used by the New Booking flow once a branch is confirmed
+    (otherwise the schedule spans every branch the doctor works at).
+
     `effective_date` (e.g. "2026-07-30"), when given, filters to ONLY
     schedule rows that are actually effective/valid on that date - using
     `fromDateTimeTo`=effective_date (the row's own validity START must be
@@ -442,6 +447,9 @@ def get_doctor_schedule(
 
     url = f"{base_url}/api/DoctorSchedules/GetList"
     payload = {"pageNumber": 1, "pageSize": page_size, "doctorIds": doctor_ids}
+
+    if branch_ids:
+        payload["branchIds"] = branch_ids
 
     if effective_date:
         payload["fromDateTimeTo"] = effective_date
