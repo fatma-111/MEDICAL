@@ -267,6 +267,59 @@ def _arabic_time_12h(iso_string: str) -> str:
     return f"{hour12}:00 {period}" if minute == 0 else f"{hour12}:{minute:02d} {period}"
 
 
+def _build_booking_confirmation_requires_tool_directive(messages: list, session_id: str) -> str:
+    """
+    If a NEW BOOKING is deep in progress (doctor AND branch both
+    confirmed in this conversation's booking session), the CURRENT last
+    message is a fresh human message, and `get_patient_info` has been
+    called more recently than `create_new_booking` (i.e. patient info
+    was collected - the review card step - but the booking itself has
+    not actually been created yet) - inject a hard reminder that
+    claiming success requires actually calling `create_new_booking`.
+
+    WHY THIS EXISTS: confirmed real production failure, the most severe
+    version of a repeated pattern - the model replied "✅ booking
+    confirmed" with a full summary, with ZERO tool calls made that turn
+    (no trace of create_new_booking in the logs at all). This means no
+    real booking existed in the system despite the user being told it
+    was successful - a serious trust and safety issue, not just a
+    scheduling inconvenience.
+    """
+
+    if not messages or not session_id:
+        return ""
+
+    from langchain_core.messages import HumanMessage as _HumanMessage
+
+    if not isinstance(messages[-1], _HumanMessage):
+        return ""
+
+    session = tools._BOOKING_SESSIONS.get(session_id)
+    if not session or not (session.get("doctor_id") and session.get("branch_id")):
+        return ""
+
+    for msg in reversed(messages[:-1]):
+        name = getattr(msg, "name", None)
+        if name == "create_new_booking":
+            return ""
+        if name == "get_patient_info":
+            return (
+                "[INTERNAL INSTRUCTION - NOT FOR THE USER - READ CAREFULLY]\n"
+                "Patient info was already collected for this new booking, "
+                "but the booking has NOT actually been created yet. You "
+                "are NOT allowed to say a booking is confirmed, "
+                "successful, or booked - in any form, in any wording - "
+                "without first calling `create_new_booking` THIS turn and "
+                "using its real returned booking_ref. Confirmed real "
+                "failure: claiming success with zero tool calls left no "
+                "real booking in the system at all, while the patient was "
+                "told otherwise. If the user just confirmed \"yes\" to the "
+                "review card, call `create_new_booking` now.\n\n"
+            )
+
+    return ""
+
+
 def _build_day_confirmation_requires_tool_directive(messages: list) -> str:
     """
     If the most recent ToolMessage in the conversation (scanning
@@ -812,11 +865,13 @@ def agent(state: AgentState) -> dict:
     )
     schedule_display_directive = _build_schedule_display_directive(state["messages"])
     day_confirmation_directive = _build_day_confirmation_requires_tool_directive(state["messages"])
+    booking_confirmation_directive = _build_booking_confirmation_requires_tool_directive(state["messages"], state.get("session_id"))
 
     system_content = (
         language_directive + no_symptom_directive + slots_directive
         + appointment_display_directive + schedule_display_directive
-        + wrong_tool_directive + day_confirmation_directive + state["system_prompt"]
+        + wrong_tool_directive + day_confirmation_directive
+        + booking_confirmation_directive + state["system_prompt"]
     )
 
     if not state.get("greeted"):
