@@ -206,15 +206,30 @@ def _build_slots_numbered_list_directive(messages: list) -> str:
     lines = [f"{_numbered_prefix(i + 1)} {slot.get('time_display', '')}" for i, slot in enumerate(slots)]
     numbered_list = "\n".join(lines)
 
+    first_slot = slots[0]
+    date_display = first_slot.get("date_display") or ""
+    service_name = first_slot.get("serviceName") or ""
+    service_price = first_slot.get("servicePrice")
+
+    header_parts = []
+    if date_display:
+        header_parts.append(f"📅 المواعيد المتاحة ليوم {date_display}")
+    if service_name:
+        price_part = f" ({service_price} ر.س)" if service_price is not None else ""
+        header_parts.append(f"— {service_name}{price_part}")
+    header = (" ".join(header_parts) + ":") if header_parts else ""
+
     return (
         "============================================================\n"
         "READY-MADE NUMBERED SLOT LIST - USE THIS EXACT TEXT\n"
         "============================================================\n"
-        "The available time slots were just looked up. Include this exact "
-        "numbered list, verbatim, in your reply (translated/introduced "
-        "naturally in your own words around it, but the list itself "
-        f"unchanged), and ask the user to reply with either the number or "
-        "the exact time:\n\n"
+        "The available time slots were just looked up. Your ENTIRE reply "
+        "must have EXACTLY this structure: the header line below (if "
+        "present), then the numbered list, then ONE question asking them "
+        "to reply with the number or the exact time. Nothing else - do "
+        "NOT also describe the slots in your own words anywhere in the "
+        "reply.\n\n"
+        f"{header}\n"
         f"{numbered_list}\n\n"
     )
 
@@ -332,20 +347,72 @@ def _build_schedule_display_directive(messages: list) -> str:
         "============================================================\n"
         "READY-MADE SCHEDULE DISPLAY BLOCK - USE THIS EXACT TEXT\n"
         "============================================================\n"
-        "The doctor's schedule was just looked up. This block below is "
-        "the ONLY schedule information to include in your reply - do "
-        "NOT ALSO write your own separate list/summary of the days or "
-        "times anywhere else in the same reply (before or after this "
-        "block). Confirmed real failure: sending both your own plain "
-        "list AND this block produces the schedule twice in one message. "
-        "Include this exact block, verbatim, in your reply (translate "
-        "the LABELS only if the conversation is in a different language "
-        "- keep the emoji icons and the actual values unchanged either "
-        "way):\n\n"
+        "The doctor's schedule was just looked up. Your ENTIRE reply "
+        "must have EXACTLY this structure and nothing more:\n"
+        "  1. At most one very short lead-in sentence (e.g. \"Here's the "
+        "doctor's schedule:\") - or none at all.\n"
+        "  2. The block below, verbatim, unchanged (translate the LABELS "
+        "only if the conversation is in a different language - keep the "
+        "emoji icons and the actual values unchanged either way).\n"
+        "  3. Exactly one question asking which day they'd prefer.\n"
+        "Nothing else, anywhere in the reply. Do NOT also describe, "
+        "list, or summarize any day/time/branch from the schedule in "
+        "your own words before or after the block - the block is the "
+        "ONLY place this information appears. Confirmed repeatedly in "
+        "production: writing your own version of the schedule ANYWHERE "
+        "in the same reply as this block sends the same information "
+        "twice.\n\n"
         f"{block}\n\n"
-        "After this block, ask ONLY which day they'd prefer - do NOT "
-        "also ask about time in this same reply, and do NOT repeat any "
-        "of this information elsewhere in the reply.\n\n"
+    )
+
+
+def _build_wrong_tool_in_booking_flow_directive(messages: list, session_id: str) -> str:
+    """
+    If the LAST message is a ToolMessage from `lookup_appointment` or
+    `check_booking_status` (the cancellation/reschedule flows' own
+    tools), AND this conversation's booking session already has a
+    confirmed doctor or branch (meaning a NEW BOOKING is genuinely in
+    progress), this is very likely the exact confirmed production bug:
+    the model mixed up "get this phone number's patient info for a NEW
+    booking" with "look up an EXISTING booking to cancel/reschedule" -
+    surfacing a different, unrelated patient's real appointment details
+    mid-booking. Inject a hard, explicit correction rather than relying
+    on prose alone, since that alone did not reliably prevent this.
+
+    Returns an empty string when there's no matching tool result, or no
+    booking is actually in progress for this session (a normal
+    cancellation/reschedule conversation must not be affected).
+    """
+
+    if not messages or not session_id:
+        return ""
+
+    last = messages[-1]
+
+    if getattr(last, "name", None) not in ("lookup_appointment", "check_booking_status"):
+        return ""
+
+    session = tools._BOOKING_SESSIONS.get(session_id)
+    if not session or not (session.get("doctor_id") or session.get("branch_id")):
+        return ""
+
+    return (
+        "============================================================\n"
+        "WRONG TOOL CALLED - YOU ARE MID NEW-BOOKING, NOT CANCELLATION\n"
+        "============================================================\n"
+        "A doctor or branch is ALREADY confirmed in this conversation's "
+        "NEW BOOKING session, meaning you are actively booking a new "
+        "appointment right now - but the tool result just returned is "
+        "from `lookup_appointment`/`check_booking_status`, which look up "
+        "an EXISTING, DIFFERENT booking (for cancellation/reschedule). "
+        "This is the wrong tool for this moment - confirmed real "
+        "production bug: this exact mistake surfaced a different, "
+        "unrelated patient's real appointment details mid-booking.\n\n"
+        "Do NOT present these results to the user, do NOT mention any "
+        "booking they show, and do NOT ask the user to pick one of "
+        "them. Instead, call `get_patient_info` with the same phone "
+        "number to continue the NEW BOOKING flow's own STEP NB6 - that "
+        "is the correct tool here.\n\n"
     )
 
 
@@ -667,11 +734,12 @@ def agent(state: AgentState) -> dict:
     slots_directive = _build_slots_numbered_list_directive(state["messages"])
     appointment_display_directive = _build_appointment_display_directive(state["messages"])
     schedule_display_directive = _build_schedule_display_directive(state["messages"])
+    wrong_tool_directive = _build_wrong_tool_in_booking_flow_directive(state["messages"], state.get("session_id"))
 
     system_content = (
         language_directive + no_symptom_directive + slots_directive
         + appointment_display_directive + schedule_display_directive
-        + state["system_prompt"]
+        + wrong_tool_directive + state["system_prompt"]
     )
 
     if not state.get("greeted"):
