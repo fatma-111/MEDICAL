@@ -217,6 +217,17 @@ AUTHENTICA_FALLBACK_EMAIL: str = os.getenv("AUTHENTICA_FALLBACK_EMAIL", "")
 # Per-clinic recipient list comes from client_config.csv's own
 # "complaint_email_to" column (see get_messages) - the SMTP server
 # credentials themselves are shared infra, not per-client.
+#
+# COMPLAINT_WEBHOOK_URL, if set, takes priority over direct SMTP: the
+# complaint's subject/body/recipients are POSTed to this n8n webhook
+# instead, and n8n's own email-send node does the actual delivery -
+# confirmed necessary in production after direct SMTP from Railway hit
+# an unresolvable connection timeout to the clinic's mail server (very
+# likely an outbound port/firewall restriction on Railway's side, or an
+# IP-allowlist on the mail server's side - n8n's own network path is
+# already confirmed working for this same system's WhatsApp messaging).
+COMPLAINT_WEBHOOK_URL: str = os.getenv("COMPLAINT_WEBHOOK_URL", "")
+
 SMTP_HOST: str = os.getenv("SMTP_HOST", "")
 SMTP_PORT: int = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USERNAME: str = os.getenv("SMTP_USERNAME", "")
