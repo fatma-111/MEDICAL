@@ -180,7 +180,7 @@ def _build_slots_numbered_list_directive(messages: list) -> str:
 
     last = messages[-1]
 
-    if getattr(last, "name", None) != "get_available_reschedule_slots":
+    if getattr(last, "name", None) not in ("get_available_reschedule_slots", "get_available_slots_for_booking"):
         return ""
 
     try:
