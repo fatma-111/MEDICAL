@@ -1372,6 +1372,11 @@ def match_entity_info(
         return {"status": "list", "items": shaped}
 
     match_result = _fuzzy_match(user_input, items, name_keys)
+    logger.info(
+        "match_entity_info: entity_type=%s user_input=%r api_returned=%d result=%s%s",
+        entity_type, user_input, len(items), match_result["result"],
+        f" score={match_result.get('score')}" if match_result["result"] == "matched" else "",
+    )
 
     if match_result["result"] == "not_matched":
         return {"status": "not_matched"}
