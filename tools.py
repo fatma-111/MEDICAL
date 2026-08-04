@@ -1674,6 +1674,10 @@ def resolve_available_day(
         return {"status": "error"}
 
     items = (result["data"] or {}).get("items", [])
+    logger.info(
+        "resolve_available_day: doctor_id=%s branch_id=%s weekday=%s after_date=%r from_date=%s to_date=%s api_returned=%d",
+        doctor_id, branch_id, weekday_name, after_date, from_date, to_date, len(items),
+    )
 
     lead_time = now + timedelta(hours=12)  # 12h minimum advance booking lead, matches production
     after_dt = None
@@ -1703,12 +1707,17 @@ def resolve_available_day(
         candidates.append(dt)
 
     if not candidates:
+        logger.info(
+            "resolve_available_day: not_found - %d raw items, none matched (weekday=%s, lead_time=%s, after_date=%s). Sample raw items: %s",
+            len(items), weekday_name, lead_time.isoformat(), after_dt, items[:3],
+        )
         return {"status": "not_found"}
 
     candidates.sort()
     chosen_dt = candidates[0]
     chosen_date = chosen_dt.date()
     english_name = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"][target_weekday]
+    logger.info("resolve_available_day: found date=%s (weekday=%s) from %d candidate(s)", chosen_date.isoformat(), english_name, len(candidates))
 
     day_start = datetime.combine(chosen_date, datetime.min.time(), tzinfo=chosen_dt.tzinfo)
     day_end = datetime.combine(chosen_date, datetime.max.time().replace(microsecond=0), tzinfo=chosen_dt.tzinfo)
@@ -1770,9 +1779,27 @@ def create_new_booking(
     # creating the booking - someone else may have taken it since it was
     # first shown to the user. Never skip this and never trust an older
     # lookup from earlier in the conversation.
+    #
+    # IMPORTANT: query the FULL DAY containing the slot, not just the
+    # slot's own narrow start/end window - a too-narrow range risks the
+    # API's own date-range boundary filtering excluding the exact slot
+    # (e.g. an inclusive/exclusive edge mismatch), even though it's a
+    # real, bookable slot (confirmed suspicious in production: a slot
+    # that was successfully booked via the website was reported
+    # "unavailable" by this exact check). The precise timestamp match
+    # below already correctly isolates the one exact slot regardless of
+    # how many others come back in a wider window.
+    try:
+        requested_start_dt = datetime.fromisoformat(slot_start)
+        day_start = requested_start_dt.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        day_end = requested_start_dt.replace(hour=23, minute=59, second=59, microsecond=0).isoformat()
+    except ValueError:
+        logger.warning("create_new_booking: unparsable slot_start=%r", slot_start)
+        return {"status": "error"}
+
     slots_result = api.get_doctor_schedule_slots(
         base_url, doctor_ids=[doctor_id], branch_ids=[branch_id],
-        from_date=slot_start, to_date=slot_end, is_booked=False, page_size=50,
+        from_date=day_start, to_date=day_end, is_booked=False, page_size=200,
     )
 
     if not slots_result["success"]:
@@ -1780,13 +1807,19 @@ def create_new_booking(
         return {"status": "error"}
 
     try:
-        requested_ms = datetime.fromisoformat(slot_start).timestamp()
+        requested_ms = requested_start_dt.timestamp()
     except ValueError:
         logger.warning("create_new_booking: unparsable slot_start=%r", slot_start)
         return {"status": "error"}
 
+    raw_items = (slots_result["data"] or {}).get("items", [])
+    logger.info(
+        "create_new_booking: re-verification doctor_id=%s branch_id=%s day_range=[%s, %s] requested_slot_start=%s api_returned=%d",
+        doctor_id, branch_id, day_start, day_end, slot_start, len(raw_items),
+    )
+
     matched_slot = None
-    for item in (slots_result["data"] or {}).get("items", []):
+    for item in raw_items:
         if item.get("isBooked"):
             continue
         try:
@@ -1798,7 +1831,10 @@ def create_new_booking(
             break
 
     if not matched_slot:
-        logger.warning("create_new_booking: requested slot %s not found or already booked (doctor_id=%s branch_id=%s)", slot_start, doctor_id, branch_id)
+        logger.warning(
+            "create_new_booking: requested slot %s not found or already booked (doctor_id=%s branch_id=%s). Raw slotStarts returned: %s",
+            slot_start, doctor_id, branch_id, [i.get("slotStart") for i in raw_items][:20],
+        )
         return {"status": "slot_unavailable"}
 
     result = api.create_booking(
@@ -1964,11 +2000,18 @@ def get_available_slots_for_booking(
         return {"status": "error"}
 
     items = (result["data"] or {}).get("items", [])
+    logger.info(
+        "get_available_slots_for_booking: doctor_id=%s branch_id=%s from_date=%s to_date=%s api_returned=%d",
+        doctor_id, branch_id, from_date, to_date, len(items),
+    )
     if not items:
+        logger.info("get_available_slots_for_booking: not_found - API returned zero items for this range")
         return {"status": "not_found"}
 
+    items_before_filter = len(items)
     items = [i for i in items if i.get("isBooked") is not True]
     if not items:
+        logger.info("get_available_slots_for_booking: not_found - all %d item(s) were isBooked=True", items_before_filter)
         return {"status": "not_found"}
 
     timezone_name = (state.get("templates") or {}).get("_timezone", DEFAULT_TIMEZONE)
@@ -1995,6 +2038,7 @@ def get_available_slots_for_booking(
         logger.exception("get_available_slots_for_booking: failed to filter past slots, showing all")
 
     if not slots:
+        logger.info("get_available_slots_for_booking: not_found - all slots were in the past relative to now")
         return {"status": "not_found"}
 
     slots.sort(key=lambda s: s["slotStart"] or "")
@@ -2013,6 +2057,141 @@ def get_available_slots_for_booking(
         slots = slots[:MAX_SLOTS_TO_SHOW]
 
     return {"status": "found", "slots": slots}
+
+
+@tool
+def find_best_doctor_in_specialty(
+    state: Annotated[AgentState, InjectedState],
+    specialty_id: str,
+    criteria: str = "soonest",
+) -> dict:
+    """Among ALL doctors in a given specialty, find either the one with
+    the SOONEST available appointment, or the one with the CHEAPEST
+    fee - use this when the user says they don't care which specific
+    doctor they see and just want the earliest opening, or explicitly
+    ask for the cheapest option (e.g. after seeing a list of doctors
+    for a specialty and asking "who's soonest?" or "who's cheapest?").
+    `specialty_id` must come from `list_specialties`'s own response -
+    never invented. `criteria`: "soonest" (default) or "cheapest".
+    Returns:
+    {"status": "found", "doctor": {...}, "slot": {...}}  # for "soonest" - present the doctor and when
+    {"status": "found", "doctor": {...}, "price": ..., "service": ...}  # for "cheapest"
+    {"status": "not_found"}  # no doctors in this specialty currently qualify
+    {"status": "not_configured"} / {"status": "error"}"""
+
+    criteria = (criteria or "soonest").strip().lower()
+    if criteria not in ("soonest", "cheapest"):
+        criteria = "soonest"
+
+    base_url = _doctors_base_url(state)
+    if not base_url:
+        logger.warning("find_best_doctor_in_specialty called but no doctors_base_url is configured for client_id=%s", state.get("client_id"))
+        return {"status": "not_configured"}
+
+    doctors_result = api.get_doctors(base_url, specialty_ids=[specialty_id], page_size=200)
+    if not doctors_result["success"]:
+        logger.error("find_best_doctor_in_specialty: get_doctors failed: status_code=%s error=%s", doctors_result.get("status_code"), doctors_result.get("error"))
+        return {"status": "error"}
+
+    doctors = [d for d in (doctors_result["data"] or {}).get("items", []) if d.get("hasSlots") is not False]
+    if not doctors:
+        return {"status": "not_found"}
+
+    doctor_ids = [d.get("id") for d in doctors if d.get("id")]
+    doctors_by_id = {d.get("id"): d for d in doctors}
+
+    timezone_name = (state.get("templates") or {}).get("_timezone", DEFAULT_TIMEZONE)
+    try:
+        tz = ZoneInfo(timezone_name)
+    except Exception:
+        tz = ZoneInfo(DEFAULT_TIMEZONE)
+
+    if criteria == "soonest":
+        now = datetime.now(tz)
+        horizon = now + timedelta(days=30)
+
+        slots_result = api.get_doctor_schedule_slots(
+            base_url, doctor_ids=doctor_ids,
+            from_date=now.isoformat(), to_date=horizon.isoformat(),
+            is_booked=False, page_size=1000,
+        )
+        if not slots_result["success"]:
+            logger.error("find_best_doctor_in_specialty: get_doctor_schedule_slots failed: status_code=%s error=%s", slots_result.get("status_code"), slots_result.get("error"))
+            return {"status": "error"}
+
+        best = None
+        for item in (slots_result["data"] or {}).get("items", []):
+            if item.get("isBooked"):
+                continue
+            slot_start = to_riyadh(item.get("slotStart"), timezone_name)
+            if not slot_start:
+                continue
+            try:
+                dt = datetime.fromisoformat(slot_start)
+            except ValueError:
+                continue
+            if dt <= now:
+                continue
+            if best is None or dt < best[0]:
+                best = (dt, item)
+
+        if not best:
+            return {"status": "not_found"}
+
+        dt, item = best
+        doctor = doctors_by_id.get(item.get("doctorId"), {})
+
+        return {
+            "status": "found",
+            "doctor": {
+                "id": item.get("doctorId"),
+                "formatedName": doctor.get("formatedName") or item.get("doctorName"),
+                "degreeName": doctor.get("degreeName"),
+            },
+            "slot": {
+                "slotStart": dt.isoformat(),
+                "slotEnd": to_riyadh(item.get("slotEnd"), timezone_name),
+                "date_display": _display_date(dt.isoformat()),
+                "time_display": _display_time_12h(dt.isoformat()),
+                "branchId": item.get("branchId"),
+                "branchName": item.get("branchName"),
+            },
+        }
+
+    # criteria == "cheapest" - queried per-doctor (confirmed request
+    # shape only supports one doctor's fees at a time reliably; the
+    # roster for a single specialty is small enough that this is fine).
+    best_price = None
+    best_doctor_id = None
+    best_service = None
+
+    for doctor_id in doctor_ids:
+        fees_result = api.get_doctor_fees(base_url, doctor_ids=[doctor_id])
+        if not fees_result["success"]:
+            continue
+        for item in (fees_result["data"] or {}).get("items", []):
+            price = item.get("price")
+            if price is None:
+                continue
+            if best_price is None or price < best_price:
+                best_price = price
+                best_doctor_id = doctor_id
+                best_service = item.get("serviceName")
+
+    if best_doctor_id is None:
+        return {"status": "not_found"}
+
+    doctor = doctors_by_id.get(best_doctor_id, {})
+    return {
+        "status": "found",
+        "doctor": {
+            "id": best_doctor_id,
+            "formatedName": doctor.get("formatedName"),
+            "degreeName": doctor.get("degreeName"),
+        },
+        "price": best_price,
+        "service": best_service,
+    }
 
 
 ALL_TOOLS = [
@@ -2039,4 +2218,5 @@ ALL_TOOLS = [
     create_new_booking,
     get_doctor_schedule_for_booking,
     get_available_slots_for_booking,
+    find_best_doctor_in_specialty,
 ]
