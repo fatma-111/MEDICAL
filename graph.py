@@ -267,6 +267,77 @@ def _arabic_time_12h(iso_string: str) -> str:
     return f"{hour12}:00 {period}" if minute == 0 else f"{hour12}:{minute:02d} {period}"
 
 
+def _build_booking_success_display_directive(messages: list, templates: dict) -> str:
+    """
+    If the LAST message is a ToolMessage from `create_new_booking` with
+    status "success", pre-build the EXACT confirmation block in code -
+    using the REAL booking_ref from the tool result (never inventable)
+    and the patient's real name from that same tool call's own
+    arguments - matching a specific format requested directly by the
+    clinic. This also reinforces, at the code level, that a booking
+    confirmation always carries its real reference number.
+    """
+
+    if not messages:
+        return ""
+
+    last = messages[-1]
+    if getattr(last, "name", None) != "create_new_booking":
+        return ""
+
+    try:
+        data = json.loads(last.content)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+
+    if data.get("status") != "success":
+        return ""
+
+    booking_ref = data.get("booking_ref")
+    if not booking_ref:
+        return ""
+
+    patient_name = ""
+    tool_call_id = getattr(last, "tool_call_id", None)
+    for msg in reversed(messages[:-1]):
+        tool_calls = getattr(msg, "tool_calls", None)
+        if not tool_calls:
+            continue
+        for tc in tool_calls:
+            if tc.get("id") == tool_call_id and tc.get("name") == "create_new_booking":
+                patient_name = (tc.get("args") or {}).get("patient_full_name", "")
+                break
+        if patient_name:
+            break
+
+    clinic_name = (templates or {}).get("_clinic_name") or ""
+    clinic_line = f"نشكر ثقتك بمستشفى {clinic_name} 🌷" if clinic_name else "نشكر ثقتك بنا 🌷"
+    greeting_line = f"✅ عزيزي/عزيزتي {patient_name}" if patient_name else "✅"
+
+    block = (
+        f"{greeting_line}\n"
+        "تم تأكيد حجز موعدك بنجاح\n"
+        f"🎉 رقم الحجز: {booking_ref}\n"
+        "📌 احتفظ برقم الحجز — تقدر تستخدمه لإلغاء الموعد أو إعادة جدولة الموعد.\n"
+        f"{clinic_line}"
+    )
+
+    return (
+        "[INTERNAL INSTRUCTION - NOT FOR THE USER - READ CAREFULLY]\n"
+        "The booking was just created successfully. Your ENTIRE reply "
+        "must be EXACTLY the text between the START/END markers below, "
+        "copied verbatim - translate only if the conversation is in a "
+        "different language (keep the emoji and the actual booking_ref "
+        "value unchanged either way). The START/END marker lines "
+        "themselves are NOT part of the text to copy - never include "
+        "them, or any other line of dashes/equals-signs, in your actual "
+        "reply. Do NOT add anything else, anywhere in the reply.\n\n"
+        "[BEGIN-EXACT-TEXT]\n"
+        f"{block}\n"
+        "[END-EXACT-TEXT]\n\n"
+    )
+
+
 def _build_booking_confirmation_requires_tool_directive(messages: list, session_id: str) -> str:
     """
     If a NEW BOOKING is deep in progress (doctor AND branch both
@@ -453,6 +524,17 @@ def _build_schedule_display_directive(messages: list) -> str:
             branch_blocks.append("\n".join(branch_lines))
         block = f"👩\u200d⚕️ الطبيب: {doctor_name}\n" + "\n\n".join(branch_blocks)
 
+    if total_day_rows == 1:
+        only_day = next(iter(by_branch.values()))[0][0]
+        closing_question_instruction = (
+            f"  3. Exactly one question asking if they'd like to see the "
+            f"available times for {only_day} (the only day shown) - do "
+            f"NOT ask \"which day\" when only one day exists at all, "
+            f"that's not a real choice and reads as confusing/redundant.\n"
+        )
+    else:
+        closing_question_instruction = "  3. Exactly one question asking which day they'd prefer.\n"
+
     return (
         "[INTERNAL INSTRUCTION - NOT FOR THE USER - READ CAREFULLY]\n"
         "The doctor's schedule was just looked up. Your ENTIRE reply "
@@ -466,7 +548,7 @@ def _build_schedule_display_directive(messages: list) -> str:
         "marker lines themselves are NOT part of the text to copy - "
         "never include them, or any other line of dashes/equals-signs, "
         "in your actual reply to the user.\n"
-        "  3. Exactly one question asking which day they'd prefer.\n"
+        f"{closing_question_instruction}"
         "Nothing else, anywhere in the reply. Do NOT also describe, "
         "list, or summarize any day/time/branch from the schedule in "
         "your own words before or after the block - the block is the "
@@ -866,12 +948,13 @@ def agent(state: AgentState) -> dict:
     schedule_display_directive = _build_schedule_display_directive(state["messages"])
     day_confirmation_directive = _build_day_confirmation_requires_tool_directive(state["messages"])
     booking_confirmation_directive = _build_booking_confirmation_requires_tool_directive(state["messages"], state.get("session_id"))
+    booking_success_directive = _build_booking_success_display_directive(state["messages"], state.get("templates"))
 
     system_content = (
         language_directive + no_symptom_directive + slots_directive
         + appointment_display_directive + schedule_display_directive
         + wrong_tool_directive + day_confirmation_directive
-        + booking_confirmation_directive + state["system_prompt"]
+        + booking_confirmation_directive + booking_success_directive + state["system_prompt"]
     )
 
     if not state.get("greeted"):
