@@ -694,7 +694,8 @@ def find_available_doctors(
 
     Returns:
     {"status": "found", "doctors": [{"id", "name", "specialtyName", "degreeName"}, ...]}
-    {"status": "not_found"}  # these specialties exist, but no doctor has availability right now
+    {"status": "found_broader_search", "doctors": [...]}  # the given specialty_ids had nobody available, but other doctors clinic-wide currently are - present these honestly as a broader alternative, not as an exact specialty match
+    {"status": "not_found"}  # nobody at all currently has availability, even clinic-wide
     {"status": "not_configured"}  # this clinic doesn't have this feature set up yet
     {"status": "error"}  # the API call itself failed"""
 
@@ -741,6 +742,46 @@ def find_available_doctors(
     )
 
     if not available:
+        # Safety net: the given specialty_ids found nobody, but a related
+        # specialty under a different name might still have doctors -
+        # confirmed real, repeated production bug where the model only
+        # passed one of several plausibly-relevant specialty ids (e.g.
+        # a general "Ophthalmology" with zero registered doctors, never
+        # also passing its "Vitreoretinal Surgery" sub-specialty where
+        # doctors actually are). Rather than relying solely on the model
+        # getting this right, automatically broaden to ALL currently
+        # available doctors clinic-wide before giving up - flagged
+        # distinctly so the reply can be honest that this is a broader
+        # result, not an exact specialty match.
+        broader_result = api.get_doctors(
+            base_url,
+            specialty_ids=None,
+            has_published_service=True,
+            has_service_schedule=True,
+            intersection_start=intersection_start,
+            intersection_end=intersection_end,
+        )
+        if broader_result["success"]:
+            broader_items = (broader_result["data"] or {}).get("items", [])
+            broader_available = [i for i in broader_items if i.get("hasSlots") is not False]
+            logger.info(
+                "find_available_doctors: narrow search found 0, broadened to all specialties: api_returned=%d after_hasSlots_filter=%d",
+                len(broader_items), len(broader_available),
+            )
+            if broader_available:
+                doctors = []
+                for i in broader_available:
+                    name = i.get("formatedName") or i.get("name")
+                    if not name:
+                        continue
+                    doctors.append({
+                        "id": i.get("id"), "name": str(name).strip(),
+                        "specialtyName": i.get("specialtyName"),
+                        "degreeName": i.get("degreeName"),
+                    })
+                if doctors:
+                    return {"status": "found_broader_search", "doctors": doctors}
+
         return {"status": "not_found"}
 
     doctors = []
@@ -1976,6 +2017,32 @@ def get_doctor_schedule_for_booking(
     items = (result["data"] or {}).get("items", [])
     if not items:
         return {"status": "not_found"}
+
+    # Auto-confirm the branch when every schedule row shares the SAME
+    # single branch - a code-level fix, since the prose instruction to
+    # "silently confirm and don't ask" was repeatedly not followed in
+    # production (the model kept asking about branch even when there
+    # was genuinely only one). This removes the LLM's role in the
+    # decision entirely.
+    if not session.get("branch_id"):
+        distinct_branch_ids = {item.get("branchId") for item in items if item.get("branchId")}
+        if len(distinct_branch_ids) == 1:
+            only_branch_id = next(iter(distinct_branch_ids))
+            only_branch_name = next((item.get("branchName") for item in items if item.get("branchId") == only_branch_id), None)
+            session["branch_id"] = only_branch_id
+            # Prefer a real Arabic altName if we can fetch it; fall back
+            # to whatever name the schedule endpoint itself provided.
+            try:
+                branches_result = api.get_branches(base_url, page_size=200)
+                if branches_result["success"]:
+                    match = next((b for b in (branches_result["data"] or {}).get("items", []) if b.get("id") == only_branch_id), None)
+                    if match:
+                        session["branch_display_name"] = _arabic_preferred_name(match)
+            except Exception:
+                logger.exception("get_doctor_schedule_for_booking: failed to enrich auto-confirmed branch name")
+            if not session.get("branch_display_name"):
+                session["branch_display_name"] = only_branch_name
+            logger.info("get_doctor_schedule_for_booking: auto-confirmed single branch_id=%s (%s) for doctor_id=%s", only_branch_id, session.get("branch_display_name"), doctor_id)
 
     doctor_display_name = session.get("doctor_display_name")
     branch_display_name = session.get("branch_display_name")
