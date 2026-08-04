@@ -1194,9 +1194,13 @@ def _normalize_arabic(text: str) -> str:
 def _fuzzy_match(user_input: str, candidates: list, name_keys: list) -> dict:
     """Match `user_input` against `candidates` (list of raw API items),
     checking each of `name_keys` per candidate. Returns:
-    {"result": "matched", "item": {...}}
+    {"result": "matched", "item": {...}, "score": 0.0-1.0}
     {"result": "ambiguous", "items": [...]}   # 2+ close, similarly-scored matches
-    {"result": "not_matched"}"""
+    {"result": "not_matched"}
+
+    `score` lets callers distinguish a high-confidence match (exact or
+    unique) from a lower-confidence one that's still worth confirming
+    with the user (likely typo) - see match_entity_for_booking."""
 
     import difflib
 
@@ -1215,7 +1219,7 @@ def _fuzzy_match(user_input: str, candidates: list, name_keys: list) -> dict:
             if normalized_input == normalized_value:
                 best_score = max(best_score, 1.0)
             elif normalized_input in normalized_value or normalized_value in normalized_input:
-                best_score = max(best_score, 0.9)
+                best_score = max(best_score, 0.96)
             else:
                 ratio = difflib.SequenceMatcher(None, normalized_input, normalized_value).ratio()
                 best_score = max(best_score, ratio)
@@ -1231,7 +1235,7 @@ def _fuzzy_match(user_input: str, candidates: list, name_keys: list) -> dict:
     close_matches = [item for item, score in scored if score >= top_score - 0.08]
 
     if len(close_matches) == 1 or top_score >= 0.98:
-        return {"result": "matched", "item": close_matches[0]}
+        return {"result": "matched", "item": close_matches[0], "score": top_score}
 
     return {"result": "ambiguous", "items": close_matches[:5]}
 
@@ -1352,6 +1356,487 @@ def match_entity_info(
     return {"status": "ambiguous", "candidates": [shape_fn(i) for i in match_result["items"]]}
 
 
+# ==========================================================
+# New Booking (create a brand new appointment)
+# ==========================================================
+#
+# Uses an internal per-session "booking session" store (module-level
+# dict keyed by session_id) so the LLM never has to handle or pass raw
+# doctor/branch UUIDs itself. This mirrors a deliberate, battle-tested
+# design confirmed directly from a real production n8n system: even
+# with full conversation history available to the model, having it
+# re-type or pass UUIDs reliably was NOT safe enough in practice there.
+# Tools read/write these fields directly via session_id; the LLM only
+# ever passes plain names/text, never IDs.
+
+_BOOKING_SESSIONS: Dict[str, dict] = {}
+
+
+def _get_booking_session(session_id: str) -> dict:
+    return _BOOKING_SESSIONS.setdefault(session_id, {
+        "doctor_id": None, "branch_id": None, "service_id": None,
+        "last_list": None,  # {"entity_type": "doctor"/"branch", "items": [shaped items]}
+    })
+
+
+@tool
+def reset_booking_session(state: Annotated[AgentState, InjectedState]) -> dict:
+    """Clear any previously-confirmed doctor/branch/service for a NEW
+    booking. Call this as the FIRST action whenever the user starts a
+    brand new booking ("حجز جديد"/"new booking"/"ابي احجز"), or
+    explicitly wants to change branch or start completely over - this
+    prevents a stale doctor/branch from a PREVIOUS booking earlier in
+    this same conversation from silently carrying over and filtering
+    results. Do NOT call this mid-flow otherwise (e.g. not just because
+    the user picked a different day or time - only for a genuine restart
+    or explicit branch change). Returns {"status": "reset"}."""
+
+    session_id = state.get("session_id")
+    _BOOKING_SESSIONS[session_id] = {"doctor_id": None, "branch_id": None, "service_id": None, "last_list": None}
+    return {"status": "reset"}
+
+
+@tool
+def match_entity_for_booking(
+    state: Annotated[AgentState, InjectedState],
+    user_input: str,
+    entity_type: str,
+) -> dict:
+    """Resolve a doctor or branch by the user's raw text for a NEW
+    BOOKING, AND automatically confirm+remember it in this booking's
+    session - you NEVER need to track, save, or pass any ID yourself;
+    this tool handles that entirely, including filtering doctors to an
+    already-confirmed branch automatically.
+
+    DUAL MODE:
+      LIST MODE (user_input=""): lists all doctors/branches. If a
+        branch is already confirmed in this booking session and
+        entity_type="doctor", the list is automatically filtered to
+        doctors at that branch only - you don't need to filter it
+        yourself or pass the branch.
+      RESOLVE MODE (user_input="user's raw text"): matches to ONE
+        entity. This also accepts a bare number referring to a position
+        in the list you most recently showed via this same tool (e.g.
+        user replies "2" after you displayed a numbered list) - always
+        pass the user's raw text/number as-is, the tool handles both
+        cases.
+
+    `entity_type`: "doctor" or "branch".
+
+    Returns one of:
+    {"matched": true, "needsConfirmation": false, "item": {...}}
+        -> CONFIRMED AND SAVED to the booking session automatically -
+           do NOT ask "are you sure" for this case, proceed directly.
+    {"matched": true, "needsConfirmation": true, "item": {...}}
+        -> a close-but-not-exact match (likely a typo) - nothing was
+           saved yet. Ask the user "did you mean [item]?" and WAIT.
+           Their "yes" is NOT a confirmation by itself - call this tool
+           AGAIN with the corrected name on that turn (that call is what
+           actually saves it) before proceeding.
+    {"matched": false, "ambiguous": true, "candidates": [...]}
+        -> multiple similarly-close matches - show each candidate's name
+           and ask the user to pick one; nothing was saved.
+    {"matched": false, "ambiguous": false}
+        -> no match at all.
+    {"status": "list", "items": [...]}
+        -> list mode result (user_input was empty).
+    {"status": "not_configured"} / {"status": "error"}"""
+
+    entity_type = (entity_type or "").strip().lower()
+    if entity_type not in ("doctor", "branch"):
+        return {"matched": False, "ambiguous": False, "status": "error"}
+
+    session_id = state.get("session_id")
+    session = _get_booking_session(session_id)
+
+    base_url = _doctors_base_url(state)
+    if not base_url:
+        logger.warning("match_entity_for_booking called but no doctors_base_url is configured for client_id=%s", state.get("client_id"))
+        return {"matched": False, "ambiguous": False, "status": "not_configured"}
+
+    if entity_type == "doctor":
+        branch_filter = [session["branch_id"]] if session.get("branch_id") else None
+        result = api.get_doctors(base_url, branch_ids=branch_filter, page_size=200)
+        name_keys = ["formatedName", "altName", "name"]
+    else:
+        result = api.get_branches(base_url, page_size=200)
+        name_keys = ["name", "altName", "formatedName", "cityName"]
+
+    if not result["success"]:
+        logger.error("match_entity_for_booking API call failed: entity_type=%s status_code=%s error=%s", entity_type, result.get("status_code"), result.get("error"))
+        return {"matched": False, "ambiguous": False, "status": "error"}
+
+    items = (result["data"] or {}).get("items", [])
+
+    def _shape(i):
+        if entity_type == "doctor":
+            return {
+                "id": i.get("id"),
+                "formatedName": i.get("formatedName") or i.get("name"),
+                "altName": i.get("altName"),
+                "degreeName": i.get("degreeName"),
+                "specialtyName": i.get("specialtyName"),
+                "branchId": i.get("branchId"),
+                "branchName": i.get("branchName"),
+            }
+        return {
+            "id": i.get("id"),
+            "name": i.get("name") or i.get("formatedName"),
+            "altName": i.get("altName"),
+            "address": i.get("address"),
+            "cityName": i.get("cityName"),
+        }
+
+    shaped_items = [_shape(i) for i in items]
+
+    if not user_input or not user_input.strip():
+        session["last_list"] = {"entity_type": entity_type, "items": shaped_items}
+        if not shaped_items:
+            return {"matched": False, "ambiguous": False, "status": "not_matched"}
+        return {"status": "list", "items": shaped_items}
+
+    # Bare number -> position in the list most recently shown for THIS entity_type
+    stripped_input = user_input.strip()
+    if stripped_input.isdigit() and session.get("last_list") and session["last_list"]["entity_type"] == entity_type:
+        position = int(stripped_input)
+        list_items = session["last_list"]["items"]
+        if 1 <= position <= len(list_items):
+            chosen_id = list_items[position - 1]["id"]
+            chosen_raw = next((i for i in items if i.get("id") == chosen_id), None)
+            if chosen_raw:
+                shaped = _shape(chosen_raw)
+                session[f"{entity_type}_id"] = shaped["id"]
+                return {"matched": True, "needsConfirmation": False, "item": shaped}
+
+    match_result = _fuzzy_match(user_input, items, name_keys)
+
+    if match_result["result"] == "not_matched":
+        return {"matched": False, "ambiguous": False}
+
+    if match_result["result"] == "ambiguous":
+        return {"matched": False, "ambiguous": True, "candidates": [_shape(i) for i in match_result["items"]]}
+
+    # matched - decide confidence: high score (exact/unique) auto-confirms
+    # and saves to session; lower score is a likely typo needing "did you
+    # mean X?" confirmation before anything is saved.
+    shaped = _shape(match_result["item"])
+    needs_confirmation = match_result["score"] < 0.95
+
+    if not needs_confirmation:
+        session[f"{entity_type}_id"] = shaped["id"]
+
+    return {"matched": True, "needsConfirmation": needs_confirmation, "item": shaped}
+
+
+@tool
+def get_doctor_fees(state: Annotated[AgentState, InjectedState]) -> dict:
+    """Get the currently-confirmed doctor's published services and
+    prices for a NEW BOOKING. Reads the doctor from the booking session
+    automatically - you never pass an ID. A doctor MUST already be
+    confirmed (via `match_entity_for_booking`, needsConfirmation=false)
+    before calling this - if none is confirmed yet, this returns
+    {"status": "no_doctor_confirmed"} and you should ask which doctor
+    they're asking about first.
+
+    IMPORTANT: fees are PRIVATE BY DEFAULT - only call this when the
+    user EXPLICITLY asks about price/cost/fee. Never mention a fee
+    proactively, and never quote one from schedule/slot data instead of
+    this tool. Returns:
+    {"status": "found", "fees": [{"service": ..., "price": ...}, ...]}
+    {"status": "no_doctor_confirmed"}
+    {"status": "not_found"}  # doctor has no published services
+    {"status": "not_configured"} / {"status": "error"}"""
+
+    session_id = state.get("session_id")
+    session = _get_booking_session(session_id)
+    doctor_id = session.get("doctor_id")
+
+    if not doctor_id:
+        return {"status": "no_doctor_confirmed"}
+
+    base_url = _doctors_base_url(state)
+    if not base_url:
+        logger.warning("get_doctor_fees called but no doctors_base_url is configured for client_id=%s", state.get("client_id"))
+        return {"status": "not_configured"}
+
+    result = api.get_doctor_fees(base_url, doctor_ids=[doctor_id])
+
+    if not result["success"]:
+        logger.error("get_doctor_fees API call failed: status_code=%s error=%s", result.get("status_code"), result.get("error"))
+        return {"status": "error"}
+
+    items = (result["data"] or {}).get("items", [])
+    if not items:
+        return {"status": "not_found"}
+
+    fees = [{"service": i.get("serviceName"), "price": i.get("price")} for i in items]
+    return {"status": "found", "fees": fees}
+
+
+@tool
+def get_patient_info(state: Annotated[AgentState, InjectedState], mobile_number: str) -> dict:
+    """Look up whether a patient is already registered by phone number,
+    for a NEW BOOKING - to avoid re-asking for their name/email if
+    they've booked before. Returns:
+    {"status": "found", "patientFullName": ..., "mobileNumber": ..., "email": ...}
+    {"status": "not_found"}  # not registered - collect name/email fresh
+    {"status": "not_configured"} / {"status": "error"}"""
+
+    base_url = _doctors_base_url(state)
+    if not base_url:
+        logger.warning("get_patient_info called but no doctors_base_url is configured for client_id=%s", state.get("client_id"))
+        return {"status": "not_configured"}
+
+    result = api.get_patient_info(base_url, mobile_number)
+
+    if not result["success"]:
+        logger.error("get_patient_info API call failed: status_code=%s error=%s", result.get("status_code"), result.get("error"))
+        return {"status": "error"}
+
+    data = result["data"] or {}
+    items = data.get("items", [])
+    if not items or not data.get("totalCount"):
+        return {"status": "not_found"}
+
+    item = items[0]
+    return {
+        "status": "found",
+        "patientFullName": item.get("patientFullName"),
+        "mobileNumber": item.get("mobileNumber"),
+        "email": item.get("email"),
+    }
+
+
+@tool
+def resolve_available_day(
+    state: Annotated[AgentState, InjectedState],
+    weekday_name: str,
+    after_date: str = "",
+) -> dict:
+    """For a NEW BOOKING: find the NEAREST date of a given weekday that
+    the currently-confirmed doctor (and branch, if also confirmed)
+    ACTUALLY has a real, non-booked slot available - not just any
+    calendar date matching that weekday. Reads doctor_id/branch_id from
+    the booking session automatically - both must already be confirmed
+    via `match_entity_for_booking` first, or this returns an error
+    telling you which is missing.
+
+    NEVER compute or guess a date yourself for a new booking - always
+    call this. `after_date` (format "YYYY-MM-DD"), if given, finds the
+    next occurrence STRICTLY AFTER that date - use this for "next
+    Thursday"/"الخميس اللي بعده" relative to one already discussed, or
+    to retry after a day turned out fully booked.
+    Returns:
+    {"status": "found", "date": "YYYY-MM-DD", "weekday_name": "Thursday", "from_date": ..., "to_date": ...}
+    {"status": "not_found"}  # no available slot for that weekday within the booking window
+    {"status": "missing_doctor"} / {"status": "missing_branch"}
+    {"status": "not_configured"} / {"status": "error"}"""
+
+    session_id = state.get("session_id")
+    session = _get_booking_session(session_id)
+    doctor_id = session.get("doctor_id")
+    branch_id = session.get("branch_id")
+
+    if not doctor_id:
+        return {"status": "missing_doctor"}
+    if not branch_id:
+        return {"status": "missing_branch"}
+
+    key = (weekday_name or "").strip().lower()
+    target_weekday = _WEEKDAY_NAMES.get(key)
+    if target_weekday is None:
+        logger.warning("resolve_available_day: unrecognized weekday_name=%r", weekday_name)
+        return {"status": "error"}
+
+    base_url = _doctors_base_url(state)
+    if not base_url:
+        logger.warning("resolve_available_day called but no doctors_base_url is configured for client_id=%s", state.get("client_id"))
+        return {"status": "not_configured"}
+
+    timezone_name = (state.get("templates") or {}).get("_timezone", DEFAULT_TIMEZONE)
+    try:
+        tz = ZoneInfo(timezone_name)
+    except Exception:
+        tz = ZoneInfo(DEFAULT_TIMEZONE)
+
+    now = datetime.now(tz)
+    horizon_days = 42  # matches the confirmed production booking window
+    from_date = now.isoformat()
+    to_date = (now + timedelta(days=horizon_days)).isoformat()
+
+    result = api.get_doctor_schedule_slots(
+        base_url, doctor_ids=[doctor_id], branch_ids=[branch_id],
+        from_date=from_date, to_date=to_date, is_booked=False, page_size=1000,
+    )
+
+    if not result["success"]:
+        logger.error("resolve_available_day API call failed: status_code=%s error=%s", result.get("status_code"), result.get("error"))
+        return {"status": "error"}
+
+    items = (result["data"] or {}).get("items", [])
+
+    lead_time = now + timedelta(hours=12)  # 12h minimum advance booking lead, matches production
+    after_dt = None
+    if after_date:
+        try:
+            after_dt = date.fromisoformat(after_date.strip())
+        except ValueError:
+            after_dt = None
+
+    candidates = []
+    for item in items:
+        if item.get("isBooked"):
+            continue
+        slot_start_local = to_riyadh(item.get("slotStart"), timezone_name)
+        if not slot_start_local:
+            continue
+        try:
+            dt = datetime.fromisoformat(slot_start_local)
+        except ValueError:
+            continue
+        if dt <= lead_time:
+            continue
+        if dt.weekday() != target_weekday:
+            continue
+        if after_dt and dt.date() <= after_dt:
+            continue
+        candidates.append(dt)
+
+    if not candidates:
+        return {"status": "not_found"}
+
+    candidates.sort()
+    chosen_dt = candidates[0]
+    chosen_date = chosen_dt.date()
+    english_name = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"][target_weekday]
+
+    day_start = datetime.combine(chosen_date, datetime.min.time(), tzinfo=chosen_dt.tzinfo)
+    day_end = datetime.combine(chosen_date, datetime.max.time().replace(microsecond=0), tzinfo=chosen_dt.tzinfo)
+
+    return {
+        "status": "found",
+        "date": chosen_date.isoformat(),
+        "weekday_name": english_name,
+        "from_date": day_start.isoformat(),
+        "to_date": day_end.isoformat(),
+    }
+
+
+@tool
+def create_new_booking(
+    state: Annotated[AgentState, InjectedState],
+    slot_start: str,
+    slot_end: str,
+    patient_full_name: str,
+    mobile_number: str,
+    email: str = "",
+) -> dict:
+    """Create a brand new appointment booking. Reads the confirmed
+    doctor_id/branch_id from the booking session automatically - you
+    never pass an ID. `slot_start`/`slot_end` MUST be the EXACT values
+    from a `resolve_available_day` + slot-lookup step in THIS
+    conversation - never modified, recomputed, or invented.
+
+    CRITICAL SAFETY CHECK (always performed automatically, you don't
+    need to do anything extra): before creating the booking, this tool
+    RE-VERIFIES the exact requested slot is still genuinely available
+    right now (someone else may have booked it in the meantime) - this
+    is not optional and cannot be skipped.
+
+    A doctor AND branch must both already be confirmed (via
+    `match_entity_for_booking`) before calling this. Returns:
+    {"status": "success", "booking_ref": "GBN-..."}
+    {"status": "slot_unavailable"}  # the requested slot is no longer free - tell the user and offer to pick again
+    {"status": "missing_doctor"} / {"status": "missing_branch"}
+    {"status": "not_configured"} / {"status": "error"}"""
+
+    session_id = state.get("session_id")
+    session = _get_booking_session(session_id)
+    doctor_id = session.get("doctor_id")
+    branch_id = session.get("branch_id")
+
+    if not doctor_id:
+        return {"status": "missing_doctor"}
+    if not branch_id:
+        return {"status": "missing_branch"}
+
+    base_url = _doctors_base_url(state)
+    if not base_url:
+        logger.warning("create_new_booking called but no doctors_base_url is configured for client_id=%s", state.get("client_id"))
+        return {"status": "not_configured"}
+
+    # Re-verify: query the EXACT requested slot's own narrow time window
+    # and confirm it's still isBooked=false right now, immediately before
+    # creating the booking - someone else may have taken it since it was
+    # first shown to the user. Never skip this and never trust an older
+    # lookup from earlier in the conversation.
+    slots_result = api.get_doctor_schedule_slots(
+        base_url, doctor_ids=[doctor_id], branch_ids=[branch_id],
+        from_date=slot_start, to_date=slot_end, is_booked=False, page_size=50,
+    )
+
+    if not slots_result["success"]:
+        logger.error("create_new_booking: re-verification API call failed: status_code=%s error=%s", slots_result.get("status_code"), slots_result.get("error"))
+        return {"status": "error"}
+
+    try:
+        requested_ms = datetime.fromisoformat(slot_start).timestamp()
+    except ValueError:
+        logger.warning("create_new_booking: unparsable slot_start=%r", slot_start)
+        return {"status": "error"}
+
+    matched_slot = None
+    for item in (slots_result["data"] or {}).get("items", []):
+        if item.get("isBooked"):
+            continue
+        try:
+            item_ms = datetime.fromisoformat(item["slotStart"].replace("Z", "+00:00")).timestamp()
+        except (ValueError, KeyError, AttributeError):
+            continue
+        if abs(item_ms - requested_ms) < 1:  # same instant
+            matched_slot = item
+            break
+
+    if not matched_slot:
+        logger.warning("create_new_booking: requested slot %s not found or already booked (doctor_id=%s branch_id=%s)", slot_start, doctor_id, branch_id)
+        return {"status": "slot_unavailable"}
+
+    result = api.create_booking(
+        base_url,
+        patient_full_name=patient_full_name,
+        mobile_number=mobile_number,
+        branch_id=matched_slot.get("branchId") or branch_id,
+        doctor_id=matched_slot.get("doctorId") or doctor_id,
+        service_id=matched_slot.get("serviceId"),
+        service_price=matched_slot.get("servicePrice"),
+        booking_time_from=slot_start,
+        booking_time_to=slot_end,
+        specialty_id=matched_slot.get("specialtyId"),
+        doctor_schedule_id=matched_slot.get("scheduleId"),
+        space_id=matched_slot.get("spaceId"),
+        email=email,
+    )
+
+    if not result["success"]:
+        logger.error("create_new_booking API call failed: status_code=%s error=%s", result.get("status_code"), result.get("error"))
+        return {"status": "error"}
+
+    new_booking_id = result["data"]
+    booking_ref = None
+
+    if new_booking_id:
+        lookup_result = api.get_booking_by_id(base_url, new_booking_id)
+        if lookup_result["success"]:
+            booking_ref = (lookup_result["data"] or {}).get("bookingRefNum")
+
+    # Booking complete - clear the session so a subsequent NEW booking
+    # in the same conversation starts clean, matching the confirmed
+    # production behavior (session auto-cleans on success).
+    _BOOKING_SESSIONS.pop(session_id, None)
+
+    return {"status": "success", "booking_ref": booking_ref}
+
+
 ALL_TOOLS = [
     validate_phone_format,
     compare_phone,
@@ -1368,4 +1853,10 @@ ALL_TOOLS = [
     reschedule_appointment,
     answer_hospital_faq,
     match_entity_info,
+    reset_booking_session,
+    match_entity_for_booking,
+    get_doctor_fees,
+    get_patient_info,
+    resolve_available_day,
+    create_new_booking,
 ]
