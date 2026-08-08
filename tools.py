@@ -795,6 +795,53 @@ def _shape_doctor_list(raw_items: list) -> list:
     return doctors
 
 
+def _doctors_at_branch(state: AgentState, base_url: str, branch_id: str) -> list:
+    """Fetch the available doctors at one branch, narrowed to the
+    specialties this booking is already about (when known), and remember
+    the list for positional selection.
+
+    Exists because "which doctors are here" changes the moment a branch
+    is confirmed - not every doctor works at every branch. Without this,
+    the model would re-display doctor names it had shown BEFORE the
+    branch was picked, which is both wrong (some of them don't work
+    there) and unselectable (the remembered list at that point is the
+    BRANCH list, so a reply of "2" resolves to nothing)."""
+
+    session = _get_booking_session(state.get("session_id"))
+    specialty_ids = session.get("specialty_ids") or None
+
+    now = datetime.utcnow()
+    result = api.get_doctors(
+        base_url,
+        specialty_ids=specialty_ids,
+        branch_ids=[branch_id],
+        has_published_service=True,
+        has_service_schedule=True,
+        intersection_start=now.isoformat() + "Z",
+        intersection_end=(now + timedelta(days=DOCTOR_AVAILABILITY_WINDOW_DAYS)).isoformat() + "Z",
+    )
+
+    if not result["success"]:
+        logger.error(
+            "_doctors_at_branch: get_doctors failed for branch_id=%s: status_code=%s error=%s",
+            branch_id, result.get("status_code"), result.get("error"),
+        )
+        return []
+
+    available = [i for i in (result["data"] or {}).get("items", []) if i.get("hasSlots") is not False]
+    doctors = _shape_doctor_list(available)
+
+    if doctors:
+        _remember_list(state, "doctor", doctors)
+
+    logger.info(
+        "_doctors_at_branch: branch_id=%s specialty_ids=%s -> %d doctor(s)",
+        branch_id, specialty_ids, len(doctors),
+    )
+
+    return doctors
+
+
 def _resolve_branch_by_name(base_url: str, branch_name: str) -> Optional[dict]:
     """Fuzzy-match the user's raw branch text against the clinic's real
     branch list. Returns the raw branch row, or None if nothing matched
@@ -1838,6 +1885,12 @@ def match_entity_for_booking(
     {"matched": true, "needsConfirmation": false, "item": {...}}
         -> CONFIRMED AND SAVED to the booking session automatically -
            do NOT ask "are you sure" for this case, proceed directly.
+           When entity_type="branch", this ALSO carries
+           "doctorsAtBranch": [...] - the doctors who actually work at
+           that branch (narrowed to this booking's specialty when known)
+           and already remembered for numeric selection. Show THAT list,
+           numbered - never re-show doctor names from before the branch
+           was chosen, because not every doctor works at every branch.
     {"matched": true, "needsConfirmation": true, "item": {...}}
         -> a close-but-not-exact match (likely a typo) - nothing was
            saved yet. Ask the user "did you mean [item]?" and WAIT.
@@ -1984,7 +2037,12 @@ def match_entity_for_booking(
                     "match_entity_for_booking: resolved position %d -> %s_id=%s (%s)",
                     position, entity_type, shaped["id"], session[f"{entity_type}_display_name"],
                 )
-                return {"matched": True, "needsConfirmation": False, "item": shaped}
+                response = {"matched": True, "needsConfirmation": False, "item": shaped}
+
+                if entity_type == "branch":
+                    response["doctorsAtBranch"] = _doctors_at_branch(state, base_url, shaped["id"])
+
+                return response
 
         logger.warning(
             "match_entity_for_booking: position %d out of range for last_list of %d %s item(s)",
@@ -2024,7 +2082,12 @@ def match_entity_for_booking(
         session[f"{entity_type}_id"] = shaped["id"]
         session[f"{entity_type}_display_name"] = _arabic_preferred_name(shaped)
 
-    return {"matched": True, "needsConfirmation": needs_confirmation, "item": shaped}
+    response = {"matched": True, "needsConfirmation": needs_confirmation, "item": shaped}
+
+    if entity_type == "branch" and not needs_confirmation and shaped.get("id"):
+        response["doctorsAtBranch"] = _doctors_at_branch(state, base_url, shaped["id"])
+
+    return response
 
 
 def _arabic_preferred_name(shaped_entity: dict) -> str:
