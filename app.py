@@ -25,6 +25,10 @@ import main as agent  # unmodified from this point of view: send_message()
 config.configure_logging()
 logger = logging.getLogger("app")
 
+# Surface a misconfigured complaint transport at startup rather than
+# only when a patient has already typed out their whole complaint.
+config.check_complaint_delivery_config()
+
 app = FastAPI(
     title="Guest Booking Cancellation Agent API",
     description="HTTP wrapper around the LLM-tool-calling LangGraph cancellation agent, for n8n/Messenger integration.",
