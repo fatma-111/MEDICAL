@@ -835,10 +835,17 @@ def list_branches_for_specialty(
     than naming branches from memory. Never list branches you did not
     get from this tool or from `match_entity_for_booking`.
 
-    Pass the SAME `specialty_ids` you used for `find_available_doctors`
-    (all plausibly-matching ones together). Returns:
+    Pass ALL plausibly-matching specialty ids together as a list, the
+    same rule as `find_available_doctors` - a general specialty and its
+    sub-specialty routinely both matter for one complaint. CONFIRMED
+    REAL FAILURE: "رمد" was passed alone and returned nothing, because
+    that specialty has zero registered doctors while its sub-specialty
+    "جراحة الشبكية" has seven - the patient was told the clinic has no
+    eye doctors at all. If two specialties could both cover what the
+    patient asked for, pass BOTH ids. Returns:
     {"status": "found", "branches": [{"id", "name", "doctorCount", "doctors": [{"id", "name", "degreeName"}, ...]}, ...]}
-    {"status": "not_found"}  # no branch currently has an available doctor in these specialties
+    {"status": "found_broader_search", "branches": [...]}  # the given specialty_ids had nobody, so this is EVERY branch/doctor clinic-wide - say so honestly and show each doctor's own specialtyName; don't present them as that specialty
+    {"status": "not_found"}  # no branch has an available doctor at all, even clinic-wide
     {"status": "not_configured"} / {"status": "error"}
 
     The branch list is remembered automatically, so the patient can
@@ -860,27 +867,53 @@ def list_branches_for_specialty(
         session["specialty_ids"] = list(specialty_ids)
 
     now = datetime.utcnow()
-    doctors_result = api.get_doctors(
-        base_url,
-        specialty_ids=specialty_ids or None,
-        has_published_service=True,
-        has_service_schedule=True,
-        intersection_start=now.isoformat() + "Z",
-        intersection_end=(now + timedelta(days=days_ahead)).isoformat() + "Z",
-    )
+    intersection_start = now.isoformat() + "Z"
+    intersection_end = (now + timedelta(days=days_ahead)).isoformat() + "Z"
 
-    if not doctors_result["success"]:
-        logger.error(
-            "list_branches_for_specialty: get_doctors failed: status_code=%s error=%s",
-            doctors_result.get("status_code"), doctors_result.get("error"),
+    def _fetch(ids):
+        result = api.get_doctors(
+            base_url,
+            specialty_ids=ids or None,
+            has_published_service=True,
+            has_service_schedule=True,
+            intersection_start=intersection_start,
+            intersection_end=intersection_end,
         )
+
+        if not result["success"]:
+            return None
+
+        available = [i for i in (result["data"] or {}).get("items", []) if i.get("hasSlots") is not False]
+        return _shape_doctor_list(available)
+
+    doctors = _fetch(specialty_ids)
+
+    if doctors is None:
+        logger.error("list_branches_for_specialty: get_doctors failed for specialty_ids=%s", specialty_ids)
         return {"status": "error"}
 
-    available = [i for i in (doctors_result["data"] or {}).get("items", []) if i.get("hasSlots") is not False]
-    doctors = _shape_doctor_list(available)
+    broadened = False
 
     if not doctors:
-        logger.info("list_branches_for_specialty: no available doctors for specialty_ids=%s", specialty_ids)
+        # SAME safety net find_available_doctors already carries, and for
+        # the same confirmed reason: the model routinely passes only ONE
+        # of several plausibly-relevant specialty ids. Real example from
+        # production - "رمد" (7b33ac7b) has ZERO registered doctors while
+        # its sub-specialty "جراحة الشبكية" (f33c9b73) has seven, so
+        # passing only the general id makes a fully-staffed clinic look
+        # empty and dead-ends the booking. Broaden clinic-wide rather
+        # than trusting the model to get the id list right, and flag it
+        # so the reply can be honest that it's a wider result.
+        logger.info("list_branches_for_specialty: 0 doctors for specialty_ids=%s - broadening clinic-wide", specialty_ids)
+
+        doctors = _fetch(None)
+        broadened = True
+
+        if doctors is None:
+            return {"status": "error"}
+
+    if not doctors:
+        logger.info("list_branches_for_specialty: no available doctors even clinic-wide")
         return {"status": "not_found"}
 
     doctors_by_id = {d["id"]: d for d in doctors if d.get("id")}
@@ -954,9 +987,12 @@ def list_branches_for_specialty(
     _remember_list(state, "branch", branches)
 
     logger.info(
-        "list_branches_for_specialty: specialty_ids=%s -> %d branch(es), %d doctor(s)",
-        specialty_ids, len(branches), len(doctors),
+        "list_branches_for_specialty: specialty_ids=%s broadened=%s -> %d branch(es), %d doctor(s)",
+        specialty_ids, broadened, len(branches), len(doctors),
     )
+
+    if broadened:
+        return {"status": "found_broader_search", "branches": branches}
 
     return {"status": "found", "branches": branches}
 
@@ -2246,6 +2282,142 @@ def resolve_available_day(
 
 
 @tool
+def list_available_days_for_booking(
+    state: Annotated[AgentState, InjectedState],
+    limit: int = 6,
+) -> dict:
+    """For a NEW BOOKING: list the doctor's REAL upcoming days that
+    actually have open slots, each with its actual calendar date. Reads
+    doctor_id/branch_id from the booking session automatically.
+
+    CALL THIS IMMEDIATELY AFTER A DOCTOR IS CONFIRMED - it replaces
+    asking the patient which day they want before they have any idea
+    when the doctor works. Patients do not know a doctor's schedule;
+    asking them to name a day first means they guess, hit a day the
+    doctor doesn't work or that's fully booked, and get stuck.
+
+    This is different from `get_doctor_schedule_for_booking`, which only
+    returns the doctor's GENERAL recurring weekdays with no dates and no
+    guarantee anything is actually free. Every day returned here is
+    confirmed to have at least one genuinely open slot, so you can show
+    its date directly without any further checking.
+
+    `limit`: how many upcoming available days to return (default 6).
+
+    Returns:
+    {"status": "found", "days": [{"date": "2026-08-11", "weekday_name": "Tuesday",
+      "date_display": "11/08/2026", "slotCount": 7, "firstTime": "10:15 AM",
+      "lastTime": "11:45 AM", "from_date": ..., "to_date": ...}, ...]}
+    {"status": "not_found"}  # this doctor has no open slot at all in the booking window
+    {"status": "missing_doctor"} / {"status": "missing_branch"}
+    {"status": "not_configured"} / {"status": "error"}
+
+    Pass a chosen day's `from_date`/`to_date` VERBATIM into
+    `get_available_slots_for_booking` - never retype or recompute them."""
+
+    session_id = state.get("session_id")
+    session = _get_booking_session(session_id)
+    doctor_id = session.get("doctor_id")
+    branch_id = session.get("branch_id")
+
+    if not doctor_id:
+        return {"status": "missing_doctor"}
+
+    base_url = _doctors_base_url(state)
+    if not base_url:
+        logger.warning("list_available_days_for_booking called but no doctors_base_url is configured for client_id=%s", state.get("client_id"))
+        return {"status": "not_configured"}
+
+    if not branch_id:
+        # Same auto-disambiguation resolve_available_day does: if this
+        # doctor works at exactly one branch, there is no real choice to
+        # make, so don't manufacture a question about it.
+        schedule_result = api.get_doctor_schedule(base_url, doctor_ids=[doctor_id])
+        if schedule_result["success"]:
+            branch_ids = {s.get("branchId") for s in (schedule_result["data"] or {}).get("items", []) if s.get("branchId")}
+            if len(branch_ids) == 1:
+                branch_id = next(iter(branch_ids))
+                session["branch_id"] = branch_id
+                logger.info("list_available_days_for_booking: auto-confirmed single branch_id=%s for doctor_id=%s", branch_id, doctor_id)
+
+    if not branch_id:
+        return {"status": "missing_branch"}
+
+    timezone_name = (state.get("templates") or {}).get("_timezone", DEFAULT_TIMEZONE)
+    try:
+        tz = ZoneInfo(timezone_name)
+    except Exception:
+        tz = ZoneInfo(DEFAULT_TIMEZONE)
+
+    now = datetime.now(tz)
+    horizon_days = 42  # same booking window resolve_available_day uses
+    lead_time = now + timedelta(hours=12)  # same 12h minimum advance lead
+
+    result = api.get_doctor_schedule_slots(
+        base_url, doctor_ids=[doctor_id], branch_ids=[branch_id],
+        from_date=now.isoformat(), to_date=(now + timedelta(days=horizon_days)).isoformat(),
+        is_booked=False, page_size=1000,
+    )
+
+    if not result["success"]:
+        logger.error("list_available_days_for_booking API call failed: status_code=%s error=%s", result.get("status_code"), result.get("error"))
+        return {"status": "error"}
+
+    items = (result["data"] or {}).get("items", [])
+
+    by_date: Dict[str, list] = {}
+
+    for item in items:
+        if item.get("isBooked"):
+            continue
+
+        slot_start_local = to_riyadh(item.get("slotStart"), timezone_name)
+        if not slot_start_local:
+            continue
+
+        try:
+            dt = datetime.fromisoformat(slot_start_local)
+        except ValueError:
+            continue
+
+        if dt <= lead_time:
+            continue
+
+        by_date.setdefault(dt.date().isoformat(), []).append(dt)
+
+    logger.info(
+        "list_available_days_for_booking: doctor_id=%s branch_id=%s api_returned=%d bookable_days=%d",
+        doctor_id, branch_id, len(items), len(by_date),
+    )
+
+    if not by_date:
+        return {"status": "not_found"}
+
+    english_weekday_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    days = []
+
+    for date_iso in sorted(by_date)[:max(1, limit)]:
+        slot_times = sorted(by_date[date_iso])
+        first = slot_times[0]
+
+        day_start = datetime.combine(first.date(), datetime.min.time(), tzinfo=first.tzinfo)
+        day_end = datetime.combine(first.date(), datetime.max.time().replace(microsecond=0), tzinfo=first.tzinfo)
+
+        days.append({
+            "date": date_iso,
+            "weekday_name": english_weekday_names[first.weekday()],
+            "date_display": _display_date(first.isoformat()),
+            "slotCount": len(slot_times),
+            "firstTime": _display_time_12h(first.isoformat()),
+            "lastTime": _display_time_12h(slot_times[-1].isoformat()),
+            "from_date": day_start.isoformat(),
+            "to_date": day_end.isoformat(),
+        })
+
+    return {"status": "found", "days": days}
+
+
+@tool
 def create_new_booking(
     state: Annotated[AgentState, InjectedState],
     slot_start: str,
@@ -2928,6 +3100,7 @@ ALL_TOOLS = [
     get_doctor_fees,
     get_patient_info,
     resolve_available_day,
+    list_available_days_for_booking,
     create_new_booking,
     get_doctor_schedule_for_booking,
     get_available_slots_for_booking,
