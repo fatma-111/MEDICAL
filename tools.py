@@ -609,6 +609,90 @@ def _doctors_base_url(state: AgentState) -> Optional[str]:
     return (state.get("templates") or {}).get("_doctors_base_url")
 
 
+# ==========================================================
+# Booking session store (moved ABOVE the doctor/specialty tools)
+# ==========================================================
+#
+# This used to live further down, next to match_entity_for_booking. It
+# was moved up because find_available_doctors / find_best_doctor_in_specialty /
+# list_branches_for_specialty ALL need to record the list they just
+# showed the user, so that a bare-number reply ("6") can be resolved
+# against it later.
+#
+# THE BUG THIS FIXES (confirmed from a real production log): the agent
+# listed 7 doctors via find_available_doctors, the user replied "6", and
+# match_entity_for_booking answered "الدكتور رقم 6 في القائمة غير موجود".
+# The number path only ever consulted session["last_list"], and ONLY
+# match_entity_for_booking ever wrote to it - so any list produced by a
+# different tool left it empty and every numeric pick failed, which in
+# turn meant no booking could ever complete from a specialty search.
+
+_BOOKING_SESSIONS: Dict[str, dict] = {}
+
+
+def _get_booking_session(session_id: str) -> dict:
+    return _BOOKING_SESSIONS.setdefault(session_id, {
+        "doctor_id": None, "branch_id": None, "service_id": None,
+        "last_list": None,  # {"entity_type": "doctor"/"branch", "items": [shaped items]}
+        "specialty_ids": None,  # remembered so later steps reuse the same specialties
+    })
+
+
+def _remember_list(state: AgentState, entity_type: str, items: list) -> None:
+    """Record the list of doctors/branches just returned to the model, so
+    a later bare-number reply can be resolved against the SAME ordering
+    the user actually saw. Every tool that returns a user-facing list
+    must call this - see the comment above _BOOKING_SESSIONS."""
+
+    session_id = state.get("session_id")
+    if not session_id:
+        return
+
+    session = _get_booking_session(session_id)
+    session["last_list"] = {"entity_type": entity_type, "items": list(items)}
+
+    logger.info(
+        "_remember_list: session_id=%s entity_type=%s count=%d",
+        session_id, entity_type, len(items),
+    )
+
+
+# Arabic-Indic (٠-٩) and Extended Arabic-Indic (۰-۹) digits -> ASCII.
+# Patients on Arabic keyboards routinely reply "٦" rather than "6"; the
+# old code path only ever handled ASCII, so those replies fell through
+# to fuzzy name matching and failed.
+_ARABIC_DIGIT_MAP = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
+
+
+def _extract_selection_number(user_input: str) -> Optional[int]:
+    """Return the list position the user meant, or None if their message
+    isn't a positional pick. Accepts a bare number in either digit set
+    ("6", "٦"), and also short phrasings that wrap one ("رقم 6",
+    "الدكتور 6", "no. 6") - but deliberately NOT a long sentence that
+    merely happens to contain a digit, which would risk hijacking a
+    real name/date."""
+
+    if not user_input:
+        return None
+
+    text = user_input.translate(_ARABIC_DIGIT_MAP).strip()
+
+    if text.isdigit():
+        return int(text)
+
+    # Short wrapper phrases only - cap the length so e.g. a free-text
+    # sentence with a number in it isn't misread as a selection.
+    if len(text) <= 25:
+        numbers = re.findall(r"\d+", text)
+        if len(numbers) == 1:
+            leftover = re.sub(r"[\d\s.،,:\-#]", "", text)
+            if leftover in ("رقم", "الرقم", "دكتور", "الدكتور", "د", "فرع", "الفرع",
+                            "no", "No", "num", "number", "option", "choice"):
+                return int(numbers[0])
+
+    return None
+
+
 @tool
 def list_specialties(state: Annotated[AgentState, InjectedState]) -> dict:
     """List every medical specialty this clinic actually offers. ALWAYS
@@ -681,16 +765,225 @@ def list_specialties(state: Annotated[AgentState, InjectedState]) -> dict:
     return {"status": "found", "specialties": specialties}
 
 
+def _shape_doctor_list(raw_items: list) -> list:
+    """Shape raw Doctors/GetList rows into the dict the model sees AND
+    the dict remembered for positional selection - one function so the
+    two can never drift apart. `altName`/`formatedName` are carried
+    through (not just a single collapsed `name`) so that a later
+    positional pick can still resolve the Arabic-preferred display name
+    via _arabic_preferred_name, even when the live roster is filtered
+    differently and the row can't be re-fetched."""
+
+    doctors = []
+
+    for i in raw_items:
+        name = i.get("name") or i.get("formatedName") or i.get("altName")
+
+        if not name or not str(name).strip():
+            logger.warning("Skipping doctor with no usable name: id=%s", i.get("id"))
+            continue
+
+        doctors.append({
+            "id": i.get("id"),
+            "name": str(name).strip(),
+            "formatedName": i.get("formatedName") or i.get("name"),
+            "altName": i.get("altName"),
+            "specialtyName": i.get("specialtyName"),
+            "degreeName": i.get("degreeName"),
+        })
+
+    return doctors
+
+
+def _resolve_branch_by_name(base_url: str, branch_name: str) -> Optional[dict]:
+    """Fuzzy-match the user's raw branch text against the clinic's real
+    branch list. Returns the raw branch row, or None if nothing matched
+    confidently. Used by the specialty -> branch -> doctor sequence so
+    the model never has to carry a branch id itself."""
+
+    branches_result = api.get_branches(base_url, page_size=200)
+
+    if not branches_result["success"]:
+        logger.error(
+            "_resolve_branch_by_name: get_branches failed: status_code=%s error=%s",
+            branches_result.get("status_code"), branches_result.get("error"),
+        )
+        return None
+
+    branch_items = (branches_result["data"] or {}).get("items", [])
+    match_result = _fuzzy_match(branch_name, branch_items, ["name", "altName", "formatedName", "cityName"])
+
+    if match_result["result"] == "matched":
+        return match_result["item"]
+
+    return None
+
+
+@tool
+def list_branches_for_specialty(
+    state: Annotated[AgentState, InjectedState],
+    specialty_ids: list,
+    days_ahead: int = DOCTOR_AVAILABILITY_WINDOW_DAYS,
+) -> dict:
+    """Show WHICH BRANCHES actually have available doctors in the given
+    specialties, together with the doctors at each one.
+
+    Call this when a patient has chosen a specialty and either asks
+    which branches exist, says they don't know the branches, or asks
+    where a given specialty is available - so you can answer with
+    something real ("فرع الدقي: د. كذا، د. كذا / فرع زايد: ...") rather
+    than naming branches from memory. Never list branches you did not
+    get from this tool or from `match_entity_for_booking`.
+
+    Pass the SAME `specialty_ids` you used for `find_available_doctors`
+    (all plausibly-matching ones together). Returns:
+    {"status": "found", "branches": [{"id", "name", "doctorCount", "doctors": [{"id", "name", "degreeName"}, ...]}, ...]}
+    {"status": "not_found"}  # no branch currently has an available doctor in these specialties
+    {"status": "not_configured"} / {"status": "error"}
+
+    The branch list is remembered automatically, so the patient can
+    reply with just its number and `match_entity_for_booking` (or
+    `find_available_doctors`'s `branch_name`) will resolve it."""
+
+    base_url = _doctors_base_url(state)
+
+    if not base_url:
+        logger.warning("list_branches_for_specialty called but no doctors_base_url is configured for client_id=%s", state.get("client_id"))
+        return {"status": "not_configured"}
+
+    session = _get_booking_session(state.get("session_id"))
+
+    if not specialty_ids:
+        specialty_ids = session.get("specialty_ids") or []
+
+    if specialty_ids:
+        session["specialty_ids"] = list(specialty_ids)
+
+    now = datetime.utcnow()
+    doctors_result = api.get_doctors(
+        base_url,
+        specialty_ids=specialty_ids or None,
+        has_published_service=True,
+        has_service_schedule=True,
+        intersection_start=now.isoformat() + "Z",
+        intersection_end=(now + timedelta(days=days_ahead)).isoformat() + "Z",
+    )
+
+    if not doctors_result["success"]:
+        logger.error(
+            "list_branches_for_specialty: get_doctors failed: status_code=%s error=%s",
+            doctors_result.get("status_code"), doctors_result.get("error"),
+        )
+        return {"status": "error"}
+
+    available = [i for i in (doctors_result["data"] or {}).get("items", []) if i.get("hasSlots") is not False]
+    doctors = _shape_doctor_list(available)
+
+    if not doctors:
+        logger.info("list_branches_for_specialty: no available doctors for specialty_ids=%s", specialty_ids)
+        return {"status": "not_found"}
+
+    doctors_by_id = {d["id"]: d for d in doctors if d.get("id")}
+
+    # Which branch is each doctor at? The Doctors endpoint doesn't
+    # reliably carry that, but DoctorSchedules does (branchId/branchName
+    # per row) - and one call covers every doctor at once.
+    schedule_result = api.get_doctor_schedule(
+        base_url, doctor_ids=list(doctors_by_id.keys()), page_size=500,
+    )
+
+    if not schedule_result["success"]:
+        logger.error(
+            "list_branches_for_specialty: get_doctor_schedule failed: status_code=%s error=%s",
+            schedule_result.get("status_code"), schedule_result.get("error"),
+        )
+        return {"status": "error"}
+
+    # Cross-reference the real branch list so the Arabic altName/address
+    # are used, rather than only the schedule row's plain branchName.
+    branches_result = api.get_branches(base_url, page_size=200)
+    branch_rows = {}
+
+    if branches_result["success"]:
+        branch_rows = {b.get("id"): b for b in (branches_result["data"] or {}).get("items", []) if b.get("id")}
+
+    grouped: Dict[str, dict] = {}
+
+    for row in (schedule_result["data"] or {}).get("items", []):
+        branch_id = row.get("branchId")
+        doctor_id = row.get("doctorId")
+
+        if not branch_id or doctor_id not in doctors_by_id:
+            continue
+
+        branch_row = branch_rows.get(branch_id) or {}
+        entry = grouped.setdefault(branch_id, {
+            "id": branch_id,
+            "name": _arabic_preferred_name(branch_row) or row.get("branchName"),
+            "address": branch_row.get("address"),
+            "cityName": branch_row.get("cityName"),
+            "altName": branch_row.get("altName"),
+            "formatedName": branch_row.get("formatedName"),
+            "doctors": [],
+            "_doctor_ids": set(),
+        })
+
+        if doctor_id not in entry["_doctor_ids"]:
+            entry["_doctor_ids"].add(doctor_id)
+            doctor = doctors_by_id[doctor_id]
+            entry["doctors"].append({
+                "id": doctor["id"],
+                "name": doctor["name"],
+                "degreeName": doctor.get("degreeName"),
+                "specialtyName": doctor.get("specialtyName"),
+            })
+
+    branches = []
+
+    for entry in grouped.values():
+        entry.pop("_doctor_ids", None)
+        entry["doctorCount"] = len(entry["doctors"])
+        branches.append(entry)
+
+    if not branches:
+        logger.info("list_branches_for_specialty: doctors found but no branch mapping for specialty_ids=%s", specialty_ids)
+        return {"status": "not_found"}
+
+    branches.sort(key=lambda b: b["doctorCount"], reverse=True)
+
+    _remember_list(state, "branch", branches)
+
+    logger.info(
+        "list_branches_for_specialty: specialty_ids=%s -> %d branch(es), %d doctor(s)",
+        specialty_ids, len(branches), len(doctors),
+    )
+
+    return {"status": "found", "branches": branches}
+
+
 @tool
 def find_available_doctors(
     state: Annotated[AgentState, InjectedState],
     specialty_ids: list,
     days_ahead: int = DOCTOR_AVAILABILITY_WINDOW_DAYS,
+    branch_name: str = "",
 ) -> dict:
     """Find doctors who currently have a bookable service AND an available
     schedule slot within the next `days_ahead` days, across one or more
     specialties. ALWAYS call `list_specialties` first to get correct ids
     - never guess or invent one.
+
+    `branch_name`: optional. Pass the user's raw branch text when they've
+    said which branch they want (e.g. "الدقي", "فرع زايد") - the branch
+    is resolved and CONFIRMED into the booking session automatically, and
+    only doctors working at that branch are returned. Leave it empty when
+    the user hasn't picked a branch (or said they don't mind). If the
+    user doesn't know which branches exist, call
+    `list_branches_for_specialty` instead of guessing.
+
+    The returned list is remembered automatically, so the user can simply
+    reply with its number ("3") and `match_entity_for_booking` will
+    resolve it - you never need to repeat the names back as ids.
 
     IMPORTANT: pass ALL plausibly-matching specialty ids in ONE call as a
     list, not just the single most obvious one. Clinics often have both
@@ -707,6 +1000,8 @@ def find_available_doctors(
     {"status": "found", "doctors": [{"id", "name", "specialtyName", "degreeName"}, ...]}
     {"status": "found_broader_search", "doctors": [...]}  # the given specialty_ids had nobody available, but other doctors clinic-wide currently are - present these honestly as a broader alternative, not as an exact specialty match
     {"status": "not_found"}  # nobody at all currently has availability, even clinic-wide
+    {"status": "branch_not_matched"}  # branch_name given but no branch matches it - show the branch list instead
+    {"status": "not_found_in_branch", "branch": {...}}  # the branch is real, but has nobody in these specialties - offer other branches
     {"status": "not_configured"}  # this clinic doesn't have this feature set up yet
     {"status": "error"}  # the API call itself failed"""
 
@@ -716,6 +1011,34 @@ def find_available_doctors(
         logger.warning("find_available_doctors called but no doctors_base_url is configured for client_id=%s", state.get("client_id"))
         return {"status": "not_configured"}
 
+    session = _get_booking_session(state.get("session_id"))
+
+    # Remember which specialties this search used, so later steps
+    # (list_branches_for_specialty, "who's soonest?") reuse exactly the
+    # same set instead of the model having to re-derive them.
+    if specialty_ids:
+        session["specialty_ids"] = list(specialty_ids)
+
+    branch_ids = None
+    matched_branch = None
+
+    if branch_name and branch_name.strip():
+        matched_branch = _resolve_branch_by_name(base_url, branch_name)
+
+        if matched_branch is None:
+            logger.info("find_available_doctors: branch_name=%r did not match any branch", branch_name)
+            return {"status": "branch_not_matched"}
+
+        branch_ids = [matched_branch["id"]]
+        session["branch_id"] = matched_branch["id"]
+        session["branch_display_name"] = _arabic_preferred_name(matched_branch)
+        logger.info("find_available_doctors: confirmed branch_id=%s (%s) from branch_name=%r", matched_branch["id"], session["branch_display_name"], branch_name)
+
+    elif session.get("branch_id"):
+        # A branch was already confirmed earlier in this booking - keep
+        # the doctor list consistent with it.
+        branch_ids = [session["branch_id"]]
+
     now = datetime.utcnow()
     intersection_start = now.isoformat() + "Z"
     intersection_end = (now + timedelta(days=days_ahead)).isoformat() + "Z"
@@ -723,6 +1046,7 @@ def find_available_doctors(
     result = api.get_doctors(
         base_url,
         specialty_ids=specialty_ids,
+        branch_ids=branch_ids,
         has_published_service=True,
         has_service_schedule=True,
         intersection_start=intersection_start,
@@ -731,8 +1055,8 @@ def find_available_doctors(
 
     if not result["success"]:
         logger.error(
-            "find_available_doctors API call failed: base_url=%s specialty_ids=%s status_code=%s error=%s",
-            base_url, specialty_ids, result.get("status_code"), result.get("error"),
+            "find_available_doctors API call failed: base_url=%s specialty_ids=%s branch_ids=%s status_code=%s error=%s",
+            base_url, specialty_ids, branch_ids, result.get("status_code"), result.get("error"),
         )
         return {"status": "error"}
 
@@ -751,6 +1075,18 @@ def find_available_doctors(
         "find_available_doctors: specialty_ids=%s api_returned=%d after_hasSlots_filter=%d",
         specialty_ids, len(items), len(available),
     )
+
+    if not available and branch_ids:
+        # The user explicitly named a branch. Broadening clinic-wide here
+        # would silently hand back doctors at OTHER branches as if they
+        # answered the question that was asked - say plainly that this
+        # branch has nobody instead, and let the reply offer the others.
+        logger.info("find_available_doctors: no doctors in specialty_ids=%s at branch_id=%s", specialty_ids, branch_ids)
+        return {
+            "status": "not_found_in_branch",
+            "branch": {"id": (matched_branch or {}).get("id") or branch_ids[0],
+                       "name": session.get("branch_display_name")},
+        }
 
     if not available:
         # Safety net: the given specialty_ids found nobody, but a related
@@ -780,37 +1116,22 @@ def find_available_doctors(
                 len(broader_items), len(broader_available),
             )
             if broader_available:
-                doctors = []
-                for i in broader_available:
-                    name = i.get("formatedName") or i.get("name")
-                    if not name:
-                        continue
-                    doctors.append({
-                        "id": i.get("id"), "name": str(name).strip(),
-                        "specialtyName": i.get("specialtyName"),
-                        "degreeName": i.get("degreeName"),
-                    })
+                doctors = _shape_doctor_list(broader_available)
                 if doctors:
+                    _remember_list(state, "doctor", doctors)
                     return {"status": "found_broader_search", "doctors": doctors}
 
         return {"status": "not_found"}
 
-    doctors = []
-    for i in available:
-        name = i.get("name") or i.get("formatedName") or i.get("altName")
-        if not name or not str(name).strip():
-            logger.warning("Skipping doctor with no usable name: id=%s", i.get("id"))
-            continue
-
-        doctors.append({
-            "id": i.get("id"),
-            "name": str(name).strip(),
-            "specialtyName": i.get("specialtyName"),
-            "degreeName": i.get("degreeName"),
-        })
+    doctors = _shape_doctor_list(available)
 
     if not doctors:
         return {"status": "not_found"}
+
+    # CRITICAL: record the exact list, in the exact order, that the model
+    # is about to show. Without this a reply of "6" cannot be resolved -
+    # the original production failure.
+    _remember_list(state, "doctor", doctors)
 
     return {"status": "found", "doctors": doctors}
 
@@ -1426,14 +1747,8 @@ def match_entity_info(
 # Tools read/write these fields directly via session_id; the LLM only
 # ever passes plain names/text, never IDs.
 
-_BOOKING_SESSIONS: Dict[str, dict] = {}
-
-
-def _get_booking_session(session_id: str) -> dict:
-    return _BOOKING_SESSIONS.setdefault(session_id, {
-        "doctor_id": None, "branch_id": None, "service_id": None,
-        "last_list": None,  # {"entity_type": "doctor"/"branch", "items": [shaped items]}
-    })
+# (_BOOKING_SESSIONS / _get_booking_session are defined near the top of
+# this module now - see the comment there for why they had to move.)
 
 
 @tool
@@ -1449,7 +1764,10 @@ def reset_booking_session(state: Annotated[AgentState, InjectedState]) -> dict:
     or explicit branch change). Returns {"status": "reset"}."""
 
     session_id = state.get("session_id")
-    _BOOKING_SESSIONS[session_id] = {"doctor_id": None, "branch_id": None, "service_id": None, "last_list": None}
+    _BOOKING_SESSIONS[session_id] = {
+        "doctor_id": None, "branch_id": None, "service_id": None,
+        "last_list": None, "specialty_ids": None,
+    }
     return {"status": "reset"}
 
 
@@ -1495,6 +1813,14 @@ def match_entity_for_booking(
            and ask the user to pick one; nothing was saved.
     {"matched": false, "ambiguous": false}
         -> no match at all.
+    {"matched": false, "status": "out_of_range", "list_size": N}
+        -> they gave a number bigger than the list you showed. Say the
+           list only has N options and ask them to pick within it - do
+           NOT say the doctor/branch "doesn't exist".
+    {"matched": false, "status": "no_list_shown"}
+        -> they gave a number but no list has been shown yet for this
+           entity_type. Show the list first (user_input=""), then let
+           them pick - again, never say the doctor "doesn't exist".
     {"status": "list", "items": [...]}
         -> list mode result (user_input was empty).
     {"status": "not_configured"} / {"status": "error"}"""
@@ -1556,6 +1882,12 @@ def match_entity_for_booking(
         if entity_type == "doctor":
             return {
                 "id": i.get("id"),
+                # `name` is included so this tool's shape matches what
+                # find_available_doctors / list_branches_for_specialty
+                # return. Without it, a doctor resolved by number came
+                # back under different keys than the same doctor in the
+                # list the user was shown.
+                "name": i.get("altName") or i.get("formatedName") or i.get("name"),
                 "formatedName": i.get("formatedName") or i.get("name"),
                 "altName": i.get("altName"),
                 "degreeName": i.get("degreeName"),
@@ -1574,24 +1906,69 @@ def match_entity_for_booking(
     shaped_items = [_shape(i) for i in items]
 
     if not user_input or not user_input.strip():
-        session["last_list"] = {"entity_type": entity_type, "items": shaped_items}
+        _remember_list(state, entity_type, shaped_items)
         if not shaped_items:
             return {"matched": False, "ambiguous": False, "status": "not_matched"}
         return {"status": "list", "items": shaped_items}
 
-    # Bare number -> position in the list most recently shown for THIS entity_type
-    stripped_input = user_input.strip()
-    if stripped_input.isdigit() and session.get("last_list") and session["last_list"]["entity_type"] == entity_type:
-        position = int(stripped_input)
-        list_items = session["last_list"]["items"]
+    # Positional pick ("6", "٦", "رقم 6") -> resolve against the list the
+    # user was ACTUALLY shown, whichever tool produced it. Two things
+    # changed here, both of which independently broke real bookings:
+    #
+    #   1. The list is now written by _remember_list from every listing
+    #      tool, not only from this one's own list mode.
+    #   2. The chosen item is taken straight from the remembered list
+    #      instead of requiring a second lookup to re-find it in this
+    #      call's freshly-fetched `items`. That re-lookup silently failed
+    #      whenever the two queries didn't line up - e.g. the list came
+    #      from an availability-filtered/specialty-filtered search but
+    #      this call fetches the unfiltered roster (or a branch-filtered
+    #      one), so the id simply wasn't there and the pick was reported
+    #      to the user as "that number doesn't exist".
+    position = _extract_selection_number(user_input)
+    last_list = session.get("last_list")
+
+    if position is not None and last_list and last_list.get("entity_type") == entity_type:
+        list_items = last_list.get("items") or []
+
         if 1 <= position <= len(list_items):
-            chosen_id = list_items[position - 1]["id"]
+            remembered = list_items[position - 1]
+            chosen_id = remembered.get("id")
+
+            # Enrich from the live roster when the same entity is present
+            # there (gives altName/branch info the remembered copy may
+            # lack); otherwise trust the remembered item as-is.
             chosen_raw = next((i for i in items if i.get("id") == chosen_id), None)
-            if chosen_raw:
-                shaped = _shape(chosen_raw)
+            shaped = _shape(chosen_raw) if chosen_raw else dict(remembered)
+
+            if shaped.get("id"):
                 session[f"{entity_type}_id"] = shaped["id"]
                 session[f"{entity_type}_display_name"] = _arabic_preferred_name(shaped)
+                logger.info(
+                    "match_entity_for_booking: resolved position %d -> %s_id=%s (%s)",
+                    position, entity_type, shaped["id"], session[f"{entity_type}_display_name"],
+                )
                 return {"matched": True, "needsConfirmation": False, "item": shaped}
+
+        logger.warning(
+            "match_entity_for_booking: position %d out of range for last_list of %d %s item(s)",
+            position, len(list_items), entity_type,
+        )
+        return {
+            "matched": False, "ambiguous": False,
+            "status": "out_of_range", "list_size": len(list_items),
+        }
+
+    if position is not None:
+        # A number, but nothing was listed for this entity_type yet -
+        # tell the model that plainly rather than letting it fall through
+        # to fuzzy-matching a digit against doctor names (which always
+        # fails and produced the misleading "that doctor doesn't exist").
+        logger.warning(
+            "match_entity_for_booking: got positional input %r but no %s list is remembered for this session",
+            user_input, entity_type,
+        )
+        return {"matched": False, "ambiguous": False, "status": "no_list_shown"}
 
     match_result = _fuzzy_match(user_input, items, name_keys)
 
@@ -2442,6 +2819,14 @@ def send_complaint_email(
         "يرجى متابعة الشكوى مع المريض واتخاذ الإجراءات اللازمة."
     )
 
+    # Two independent delivery paths, tried in order. Previously a
+    # webhook failure returned "error" immediately WITHOUT ever trying
+    # SMTP, and a missing configuration was indistinguishable in the
+    # reply from a genuine send failure - between them, complaints could
+    # silently never arrive at the configured mailbox while the code
+    # looked like it had "a webhook and an SMTP fallback".
+    attempts: list = []
+
     if COMPLAINT_WEBHOOK_URL:
         # Preferred path: hand off the actual sending to n8n (its own
         # network path is already confirmed working for this system),
@@ -2466,16 +2851,31 @@ def send_complaint_email(
                 timeout=15,
             )
             response.raise_for_status()
-        except Exception:
-            logger.exception("send_complaint_email: failed to POST to COMPLAINT_WEBHOOK_URL")
-            return {"status": "error"}
+        except Exception as exc:
+            attempts.append(f"webhook: {type(exc).__name__}: {exc}")
+            logger.exception("send_complaint_email: failed to POST to COMPLAINT_WEBHOOK_URL - falling back to SMTP if configured")
+        else:
+            logger.info("send_complaint_email: sent complaint via webhook for patient_name=%r category=%r to=%s", patient_name, category, to_emails)
+            return {"status": "sent", "via": "webhook"}
+    else:
+        attempts.append("webhook: COMPLAINT_WEBHOOK_URL not set")
 
-        logger.info("send_complaint_email: sent complaint via webhook for patient_name=%r category=%r to=%s", patient_name, category, to_emails)
-        return {"status": "sent"}
+    missing_smtp = [
+        name for name, value in (
+            ("SMTP_HOST", SMTP_HOST),
+            ("SMTP_USERNAME", SMTP_USERNAME),
+            ("SMTP_PASSWORD", SMTP_PASSWORD),
+        ) if not value
+    ]
 
-    if not SMTP_HOST or not SMTP_USERNAME or not SMTP_PASSWORD:
-        logger.error("send_complaint_email: neither COMPLAINT_WEBHOOK_URL nor SMTP is configured")
-        return {"status": "error"}
+    if missing_smtp:
+        attempts.append("smtp: missing " + ", ".join(missing_smtp))
+        logger.error(
+            "send_complaint_email: complaint NOT delivered for client_id=%s - no working transport. Attempts: %s. "
+            "Set COMPLAINT_WEBHOOK_URL (recommended) or the SMTP_* variables.",
+            state.get("client_id"), " | ".join(attempts),
+        )
+        return {"status": "error", "reason": "no_transport_configured", "attempts": attempts}
 
     msg = MIMEText(body, "plain", "utf-8")
     msg["Subject"] = subject
@@ -2494,12 +2894,16 @@ def send_complaint_email(
             server.sendmail(SMTP_FROM_EMAIL, to_emails, msg.as_string())
         finally:
             server.quit()
-    except Exception:
-        logger.exception("send_complaint_email: failed to send email via SMTP")
-        return {"status": "error"}
+    except Exception as exc:
+        attempts.append(f"smtp: {type(exc).__name__}: {exc}")
+        logger.exception(
+            "send_complaint_email: complaint NOT delivered for client_id=%s. Attempts: %s",
+            state.get("client_id"), " | ".join(attempts),
+        )
+        return {"status": "error", "reason": "send_failed", "attempts": attempts}
 
-    logger.info("send_complaint_email: sent complaint email for patient_name=%r category=%r to=%s", patient_name, category, to_emails)
-    return {"status": "sent"}
+    logger.info("send_complaint_email: sent complaint email via SMTP for patient_name=%r category=%r to=%s", patient_name, category, to_emails)
+    return {"status": "sent", "via": "smtp"}
 
 
 ALL_TOOLS = [
@@ -2512,6 +2916,7 @@ ALL_TOOLS = [
     verify_otp,
     list_specialties,
     find_available_doctors,
+    list_branches_for_specialty,
     get_next_weekday_date,
     get_doctor_schedule,
     get_available_reschedule_slots,
