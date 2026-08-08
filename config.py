@@ -463,3 +463,70 @@ def get_messages(client_id: str, dialect: Optional[str] = None) -> dict:
     )
 
     return merged
+
+
+# ==========================================================
+# Startup self-check for complaint delivery
+# ==========================================================
+#
+# A clinic can have complaint_email_to filled in perfectly in
+# client_config.csv and STILL never receive a single complaint, because
+# the transport that actually delivers it (n8n webhook or SMTP) is
+# configured entirely separately, via env vars. Nothing used to surface
+# that mismatch - the agent would collect a full complaint and only then
+# fail, with the reason buried in one log line. Log it once at startup
+# instead, naming exactly what's missing.
+
+
+def complaint_transport_status() -> dict:
+    """Describe how complaint emails would be delivered right now.
+
+    Returns {"ready": bool, "transport": "webhook"/"smtp"/None,
+             "missing": [names of unset env vars]}.
+    """
+
+    if COMPLAINT_WEBHOOK_URL:
+        return {"ready": True, "transport": "webhook", "missing": []}
+
+    missing = [
+        name for name, value in (
+            ("SMTP_HOST", SMTP_HOST),
+            ("SMTP_USERNAME", SMTP_USERNAME),
+            ("SMTP_PASSWORD", SMTP_PASSWORD),
+        ) if not value
+    ]
+
+    if missing:
+        return {"ready": False, "transport": None, "missing": ["COMPLAINT_WEBHOOK_URL"] + missing}
+
+    return {"ready": True, "transport": "smtp", "missing": []}
+
+
+def check_complaint_delivery_config() -> None:
+    """Log a warning for every client that has complaint recipients
+    configured while no delivery transport exists. Called from
+    configure_logging()'s callers at startup."""
+
+    clients_expecting_complaints = [
+        client_id for client_id, row in _all_client_configs().items()
+        if (row.get("complaint_email_to") or "").strip()
+    ]
+
+    if not clients_expecting_complaints:
+        return
+
+    status = complaint_transport_status()
+
+    if status["ready"]:
+        logger.info(
+            "Complaint delivery ready via %s for client(s): %s",
+            status["transport"], ", ".join(clients_expecting_complaints),
+        )
+        return
+
+    logger.warning(
+        "COMPLAINT EMAIL WILL FAIL: client(s) %s have complaint_email_to configured, but no delivery "
+        "transport is set up. Set COMPLAINT_WEBHOOK_URL (recommended - routes through n8n), or all of "
+        "SMTP_HOST / SMTP_USERNAME / SMTP_PASSWORD. Currently unset: %s",
+        ", ".join(clients_expecting_complaints), ", ".join(status["missing"]),
+    )
